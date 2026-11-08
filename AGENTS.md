@@ -1,3 +1,12 @@
+# Human-only files
+
+The following files in this repository are considered human-only and may not be edited by agents unless explicitly instructed:
+
+README.md
+LICENSE.md
+SOURCES.md
+.gitignore
+
 # Commit conventions
 
 - Create a git commit only when the user explicitly instructs you to do so.
