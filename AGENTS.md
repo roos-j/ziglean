@@ -2,10 +2,17 @@
 
 The following files in this repository are considered human-only and may not be edited by agents unless explicitly instructed:
 
+AGENTS.md
 README.md
 LICENSE.md
 SOURCES.md
 .gitignore
+
+# Record keeping
+
+Agents should record user instructions in their own words in `automation/instructions.md`.
+Records must be brief, precise, time-stamped (US Eastern time, no seconds)
+and numbered, starting with `R1`, `R2`, ..
 
 # Commit conventions
 
