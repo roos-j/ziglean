@@ -1,0 +1,17 @@
+.zig-cache/
+zig-out/
+.tools/
+.upstream/
+/arena/
+reports/
+*.pdb
+*.exe
+*.tar.gz
+*.zip
+__pycache__/
+*.obj
+*.o
+vendor/
+*.log
+benchmarks/
+tests/

@@ -1,0 +1,16 @@
+{
+  "bundle_sha256": "aff129ed66c22a2befd3ffc2ce02dc61cc84cec096bc977d46dc885638468797",
+  "url": "https://arena.lean-lang.org/lean-arena-tests.tar.gz",
+  "cases": {
+    "beta": "good/tutorial/007_betaReduction2.ndjson",
+    "dependent_let": "good/tutorial/034_letTypeDep.ndjson",
+    "quotient": "good/tutorial/130_quotLiftReduction.ndjson",
+    "bad_projection": "bad/tutorial/094_projProp6.ndjson",
+    "bad_recursor": "bad/bugs/rec-missing-ih.ndjson",
+    "nested_capture": "bad/bugs/nested-name-capture.ndjson",
+    "bad_universe": "bad/other/inductive-undeclared-universe.ndjson",
+    "recursive": "good/tutorial/122_rtreeRecReduction.ndjson",
+    "projection_equal_bases": "good/perf/proj-cheap-struct.ndjson",
+    "projection_equal_fields": "good/perf/proj-lazy-struct.ndjson"
+  }
+}
