@@ -1,6 +1,6 @@
 const std = @import("std");
-const expr = @import("../src/expr.zig");
-const level = @import("../src/level.zig");
+const expr = @import("../../src/expr.zig");
+const level = @import("../../src/level.zig");
 
 test "compact global nodes retain every payload and large loose-variable range" {
     var levels = level.Pool.init(std.testing.allocator);

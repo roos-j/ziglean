@@ -15,7 +15,9 @@ vendor/
 *.log
 benchmarks/
 /tests/*
-!/tests/*.zig
+!/tests/unit/
+!/tests/kernel/
+/tests/kernel/good/large/
 /automation/measurements/
 /claude/
 

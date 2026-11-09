@@ -1,9 +1,9 @@
 const std = @import("std");
-const parsed_stream = @import("../src/parsed_stream.zig");
-const Importer = @import("../src/import.zig").Importer;
-const Environment = @import("../src/environment.zig").Environment;
-const ExprPool = @import("../src/expr.zig").Pool;
-const LevelPool = @import("../src/level.zig").Pool;
+const parsed_stream = @import("../../src/parsed_stream.zig");
+const Importer = @import("../../src/import.zig").Importer;
+const Environment = @import("../../src/environment.zig").Environment;
+const ExprPool = @import("../../src/expr.zig").Pool;
+const LevelPool = @import("../../src/level.zig").Pool;
 
 const ChunkReader = struct {
     bytes: []const u8,
@@ -23,7 +23,7 @@ const ChunkReader = struct {
     }
 };
 
-fn apply(importer: *Importer, allocator: std.mem.Allocator, item: parsed_stream.Item) @import("../src/common.zig").Error!void {
+fn apply(importer: *Importer, allocator: std.mem.Allocator, item: parsed_stream.Item) @import("../../src/common.zig").Error!void {
     return switch (item) {
         .scanned => |value| importer.scanned(value.record(), value.text()),
         .json => |value| importer.line(value.*),
@@ -213,7 +213,7 @@ test "compact parsed records preserve every scanner kind and full integer fields
         defer stream.release(batch);
         try std.testing.expectEqual(@as(usize, 1), batch.length);
         try std.testing.expect(batch.get(0) == .scanned);
-        const expected = @import("../src/scan.zig").scan(line).?;
+        const expected = @import("../../src/scan.zig").scan(line).?;
         const compact = batch.get(0).scanned;
         const actual = compact.record();
         try std.testing.expectEqual(expected.kind, actual.kind);

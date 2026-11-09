@@ -1,6 +1,6 @@
 const std = @import("std");
-const expr = @import("../src/expr.zig");
-const level = @import("../src/level.zig");
+const expr = @import("../../src/expr.zig");
+const level = @import("../../src/level.zig");
 
 fn sharedBody(expressions: *expr.Pool, universes: u32) expr.Expr {
     var body = expressions.app(expressions.cnst(100, universes), expressions.bvar(0));

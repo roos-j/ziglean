@@ -1,6 +1,6 @@
 const std = @import("std");
-const expr = @import("../src/expr.zig");
-const level = @import("../src/level.zig");
+const expr = @import("../../src/expr.zig");
+const level = @import("../../src/level.zig");
 
 test "packed binary import reads flags and ranges from escaped children" {
     var levels = level.Pool.init(std.testing.allocator);

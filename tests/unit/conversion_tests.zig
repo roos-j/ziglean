@@ -1,8 +1,8 @@
 const std = @import("std");
-const level = @import("../src/level.zig");
-const expr = @import("../src/expr.zig");
-const Environment = @import("../src/environment.zig").Environment;
-const Checker = @import("../src/type_checker.zig").Checker;
+const level = @import("../../src/level.zig");
+const expr = @import("../../src/expr.zig");
+const Environment = @import("../../src/environment.zig").Environment;
+const Checker = @import("../../src/type_checker.zig").Checker;
 
 test "delta priority avoids instantiating an unused polymorphic body" {
     var levels = level.Pool.init(std.testing.allocator);
@@ -105,15 +105,15 @@ test "scoped inference abstracts dependent results and distinguishes shadowed do
     try std.testing.expect(try checker.defeq(expected, unchecked));
     try std.testing.expect(try checker.defeq(expected, checked));
     try std.testing.expect(!expressions.hasFreeVariables(checked));
-    try std.testing.expectError(error.TypeMismatch, @import("../src/inference.zig").checkAgainst(&checker, term, wrong));
+    try std.testing.expectError(error.TypeMismatch, @import("../../src/inference.zig").checkAgainst(&checker, term, wrong));
     try std.testing.expectEqual(@as(u32, 0), checker.binder_depth);
 
     // A let between surrounding scopes must retain its own value and leave
     // the same dependent result after the let-local is substituted away.
     const let_body = expressions.mk(.letE, expressions.bvar(2), expressions.bvar(0), expressions.bvar(0));
     const with_let = expressions.binder(.lam, prop, expressions.binder(.lam, prop, expressions.binder(.lam, expressions.bvar(1), let_body)));
-    try @import("../src/inference.zig").checkAgainst(&checker, with_let, expected);
-    try std.testing.expectError(error.TypeMismatch, @import("../src/inference.zig").checkAgainst(&checker, with_let, wrong));
+    try @import("../../src/inference.zig").checkAgainst(&checker, with_let, expected);
+    try std.testing.expectError(error.TypeMismatch, @import("../../src/inference.zig").checkAgainst(&checker, with_let, wrong));
     try std.testing.expectEqual(@as(u32, 0), checker.binder_depth);
 }
 
@@ -198,7 +198,7 @@ test "constant-type profiling excludes overlays and separates permanent substitu
     const parameter = levels.param(parameter_name);
     const name = environment.named("ProfiledType");
     const parameters = [_]u32{parameter_name};
-    const declaration: @import("../src/environment.zig").Decl = .{
+    const declaration: @import("../../src/environment.zig").Decl = .{
         .name = name,
         .kind = .axiom,
         .ty = expressions.sort(levels.succ(parameter)),
@@ -282,7 +282,7 @@ test "batched data projections instantiate dependent fields and preserve alias f
     const y_type = expressions.app(expressions.bvar(0), expressions.bvar(1));
     const family_type = expressions.binder(.pi, expressions.bvar(1), type_);
     const constructor_type = expressions.binder(.pi, type_, expressions.binder(.pi, expressions.bvar(0), expressions.binder(.pi, family_type, expressions.binder(.pi, y_type, result))));
-    var constructor: @import("../src/environment.zig").Decl = .{ .name = ctor_name, .kind = .ctor, .ty = constructor_type, .details = environment.copyDetails(.{ .parent = name, .num_params = 1, .num_fields = 3 }) };
+    var constructor: @import("../../src/environment.zig").Decl = .{ .name = ctor_name, .kind = .ctor, .ty = constructor_type, .details = environment.copyDetails(.{ .parent = name, .num_params = 1, .num_fields = 3 }) };
     try environment.add(constructor);
     var checker = Checker.init(&expressions, &environment);
     defer checker.deinit();

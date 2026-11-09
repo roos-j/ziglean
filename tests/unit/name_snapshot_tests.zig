@@ -1,5 +1,5 @@
 const std = @import("std");
-const Environment = @import("../src/environment.zig").Environment;
+const Environment = @import("../../src/environment.zig").Environment;
 
 test "concurrent snapshots share stable names and strings with private worker additions" {
     var base = Environment.init(std.testing.allocator);

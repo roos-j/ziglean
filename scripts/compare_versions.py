@@ -61,7 +61,7 @@ def main():
                              for name in sorted(snapshot.namelist()) if name.endswith(".zig")}
     else:
         source_hashes = {path.as_posix(): digest(path) for path in
-                         sorted([*Path("src").glob("*.zig"), *Path("tests").glob("*.zig"),
+                         sorted([*Path("src").glob("*.zig"), *Path("tests").rglob("*.zig"),
                                  Path("build.zig"), Path("test.zig")])}
     result = {
         "recorded_at_utc": datetime.now(timezone.utc).isoformat(),

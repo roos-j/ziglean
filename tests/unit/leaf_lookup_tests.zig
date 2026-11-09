@@ -1,6 +1,6 @@
 const std = @import("std");
-const LevelPool = @import("../src/level.zig").Pool;
-const ExprPool = @import("../src/expr.zig").Pool;
+const LevelPool = @import("../../src/level.zig").Pool;
+const ExprPool = @import("../../src/expr.zig").Pool;
 
 test "workers preserve imported leaf identities and isolate private universe leaves" {
     var levels = LevelPool.init(std.testing.allocator);

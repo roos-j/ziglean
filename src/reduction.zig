@@ -167,7 +167,13 @@ fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
         var aa: c.SmallList(Expr, 16) = .{};
         defer aa.deinit(m.allocator);
         const h = m.get(m.unfoldApps(v, &aa));
-        if (h.kind == .cnst and h.a == self.environment.builtin("Quot.mk") and aa.items.len == 3) return m.apps(m.app(args[3], aa.items[2]), args[major + 1 ..]);
+        if (h.kind == .cnst and h.a == self.environment.builtin("Quot.mk") and aa.items.len == 3) {
+            // An ordinary axiom can have this name without being the quotient
+            // constructor. Its arguments must not acquire primitive reduction.
+            const constructor = self.environment.find(h.a) orelse return null;
+            if (constructor.kind != .quotient or constructor.details.quot_kind != .mk) return null;
+            return m.apps(m.app(args[3], aa.items[2]), args[major + 1 ..]);
+        }
         return null;
     }
     if (d.kind != .recursor) return null;

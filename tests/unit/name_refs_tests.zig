@@ -1,8 +1,8 @@
 const std = @import("std");
-const Importer = @import("../src/import.zig").Importer;
-const Environment = @import("../src/environment.zig").Environment;
-const ExprPool = @import("../src/expr.zig").Pool;
-const LevelPool = @import("../src/level.zig").Pool;
+const Importer = @import("../../src/import.zig").Importer;
+const Environment = @import("../../src/environment.zig").Environment;
+const ExprPool = @import("../../src/expr.zig").Pool;
+const LevelPool = @import("../../src/level.zig").Pool;
 
 fn apply(importer: *Importer, bytes: []const u8, json: bool) !void {
     if (!json) return importer.lineBytes(std.testing.allocator, bytes);

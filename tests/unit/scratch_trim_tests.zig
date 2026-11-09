@@ -1,8 +1,8 @@
 const std = @import("std");
-const expr = @import("../src/expr.zig");
-const level = @import("../src/level.zig");
-const Environment = @import("../src/environment.zig").Environment;
-const Checker = @import("../src/type_checker.zig").Checker;
+const expr = @import("../../src/expr.zig");
+const level = @import("../../src/level.zig");
+const Environment = @import("../../src/environment.zig").Environment;
+const Checker = @import("../../src/type_checker.zig").Checker;
 
 const retained_nodes = 64 * 1024;
 

@@ -1,0 +1,9 @@
+{
+  "description": "Expected rejection: a forged ordinary axiom named Quot.mk triggers quotient reduction and permits finalContradiction : False. This variant removes the unused Quot.ind declaration from the upstream Arena negative test.",
+  "outcome": "reject",
+  "upstream_revision": "9505c450316294b58bffcb53c7d8d0aa00a3d144",
+  "source": "https://github.com/leanprover/lean-kernel-arena/blob/9505c450316294b58bffcb53c7d8d0aa00a3d144/tests/bugs/axiom-quot-mk.ndjson",
+  "source_sha256": "11eb2a543c3fc8ea2e348c1034053e32097d86af93353a349e965c4c51fa0c39",
+  "modification": "Remove the single quot record with kind ind; preserve all other JSON records and references.",
+  "regression": "Before the declaration-kind guard in quotient reduction, ziglean accepted this negative input in both sequential and parallel modes. It must be rejected, not accepted or declined."
+}

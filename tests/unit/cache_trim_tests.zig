@@ -1,7 +1,7 @@
 const std = @import("std");
-const check_cache = @import("../src/check_cache.zig");
-const expr = @import("../src/expr.zig");
-const level = @import("../src/level.zig");
+const check_cache = @import("../../src/check_cache.zig");
+const expr = @import("../../src/expr.zig");
+const level = @import("../../src/level.zig");
 
 const map_limit = 64 * 1024;
 const transform_limit = 64 * 1024;

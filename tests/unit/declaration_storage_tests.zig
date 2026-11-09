@@ -1,15 +1,15 @@
 const std = @import("std");
-const environment = @import("../src/environment.zig");
+const environment = @import("../../src/environment.zig");
 
 test "ordinary declaration groups validate references without allocating details" {
     const allocator = std.testing.allocator;
-    var levels = @import("../src/level.zig").Pool.init(allocator);
+    var levels = @import("../../src/level.zig").Pool.init(allocator);
     defer levels.deinit();
-    var expressions = @import("../src/expr.zig").Pool.init(allocator, &levels);
+    var expressions = @import("../../src/expr.zig").Pool.init(allocator, &levels);
     defer expressions.deinit();
     var env = environment.Environment.init(allocator);
     defer env.deinit();
-    var importer = @import("../src/import.zig").Importer.init(&expressions, &env);
+    var importer = @import("../../src/import.zig").Importer.init(&expressions, &env);
     defer importer.deinit();
     const prefix =
         \\{"meta":{"format":{"version":"3.1.0"}}}
@@ -94,15 +94,15 @@ test "compact declaration details stay immutable across snapshots and worker res
 
 test "inductive checking restores exported recursor details without changing shared records" {
     const allocator = std.testing.allocator;
-    var levels = @import("../src/level.zig").Pool.init(allocator);
+    var levels = @import("../../src/level.zig").Pool.init(allocator);
     defer levels.deinit();
-    var expressions = @import("../src/expr.zig").Pool.init(allocator, &levels);
+    var expressions = @import("../../src/expr.zig").Pool.init(allocator, &levels);
     defer expressions.deinit();
     var base = environment.Environment.init(allocator);
     defer base.deinit();
-    var importer = @import("../src/import.zig").Importer.init(&expressions, &base);
+    var importer = @import("../../src/import.zig").Importer.init(&expressions, &base);
     defer importer.deinit();
-    var lines = std.mem.tokenizeScalar(u8, @embedFile("fixtures/conversion.ndjson"), '\n');
+    var lines = std.mem.tokenizeScalar(u8, @embedFile("../kernel/good/conversion.ndjson"), '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "{\"inductive\"")) {
             try importer.lineBytes(allocator, line);
@@ -130,10 +130,10 @@ test "inductive checking restores exported recursor details without changing sha
         defer worker_levels.deinit();
         var worker_expressions = expressions.fork(&worker_levels);
         defer worker_expressions.deinit();
-        var checker = @import("../src/type_checker.zig").Checker.init(&worker_expressions, &worker);
+        var checker = @import("../../src/type_checker.zig").Checker.init(&worker_expressions, &worker);
         defer checker.deinit();
         checker.beginDeclaration();
-        try @import("../src/inductive.zig").check(&checker, &.{type_}, &.{constructor}, &.{recursor});
+        try @import("../../src/inductive.zig").check(&checker, &.{type_}, &.{constructor}, &.{recursor});
         // check() has destroyed its generation arena. The installed recursor
         // must have returned to the original immutable exported metadata.
         try std.testing.expect(worker.find(recursor.name).?.details == recursor.details);
