@@ -404,3 +404,187 @@ created.
 The final ReleaseFast build succeeded, and the remaining production source
 files match O7 byte-for-byte. The source-layout cleanup did not change kernel
 behavior; no further full-Mathlib benchmark was needed.
+
+## O8 - 2026-11-09 00:00 EST - Bounded hybrid NbE
+
+Added `src/nbe.zig`, a closure/environment evaluator with shared semantic
+applications, separate beta/let and core/full WHNF memos, and capture-safe
+readback. Universe specialization and literal arithmetic reuse existing kernel
+operations. K reduction and structure eta still use the existing checker;
+quotient reduction checks the actual primitive declaration kind, including the
+previous forged-`Quot.mk` regression.
+
+The production strategy retains substitution for ordinary dependent conversion.
+After 32,768 checker steps or newly allocated syntax nodes, closed beta/let
+requests and closed Boolean reflection requests may use NbE. The threshold and
+selection depend on term structure and work, never input filenames or expected
+verdicts. A declaration gets at most 65,536 speculative steps across all NbE
+requests, including calls back into the existing checker. Exhaustion or the
+internal depth/storage limits retries the original term with substitution and
+disables NbE for that declaration. All evaluator state is private to a request;
+conversion and declaration acceptance remain in the existing kernel.
+
+Broader, unbounded prototypes regressed let-fold and dependent Mathlib
+conversion and were not retained. The final strategy deliberately does not try
+to replace all conversion or inference with NbE. In particular, app-lam remains
+inference-bound. The added tests compare 400 generated scoped terms against
+substitution and cover capture, dependent binder domains, sparse/wide captures,
+universe specialization, discarded arguments, quotient/recursor/projection
+rules, and budget fallback/reset. Ordinary reductions check eligibility without
+entering the evaluator's allocation/cleanup frame.
+
+Final executable: `zig-out/bin/ziglean.exe`, SHA-256
+`b0197a7365fb84f066d76bb4425a279ccb615b56769e33b2024c9a224b65e3aa`.
+Baseline: `.tools/nbe/baseline.exe`, SHA-256
+`a4ec6b0f4850cfd4b9d824c3e5a18d9cac6878ff56f16b050b652396cc21f6a0`.
+The baseline is the previously validated quotient-fixed checker. The final Zig
+sources are archived in `.tools/nbe/final-source.zip`; source hashes are also
+recorded in the measurement reports.
+
+Windows ReleaseFast measurements below use three alternating measured pairs
+following one warmup per executable, with 16 workers for the four large exports
+and four workers for compact stress cases. Both executables use batch size
+16,384, one billion steps and 128 million temporary nodes per declaration.
+Times are medians; memory is the maximum OS peak working set among measured
+runs. No outliers were removed. The two longest magma cases use just one pair
+without warmups, so those rows are single-run checks rather than stable speed
+estimates. Every run's acceptance count and imported expression count matched
+between executables.
+
+| Input | Baseline seconds | Hybrid seconds | Time change | Baseline peak MiB | Hybrid peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mathlib | 11.6246 | 11.8968 | +2.3% | 1247.2 | 1331.8 |
+| scaling-large | 4.0692 | 4.2609 | +4.7% | 605.1 | 629.6 |
+| normalization | 0.5656 | 0.5553 | -1.8% | 124.5 | 127.0 |
+| pushforward | 0.1135 | 0.1346 | +18.7% | 72.8 | 66.7 |
+| beta-ladder | 2.9581 | 1.6868 | -43.0% | 477.3 | 241.0 |
+| app-lam | 7.5220 | 7.3938 | -1.7% | 1010.8 | 1010.8 |
+| let-fold | 0.2800 | 0.2757 | -1.5% | 77.9 | 77.9 |
+| let-ladder | 0.9368 | 0.8285 | -11.6% | 241.7 | 240.9 |
+| magma-list-deep-n21 | 1.5985 | 1.5268 | -4.5% | 124.1 | 125.0 |
+| magma-list-deep-n36 (one pair) | 53.9604 | 53.6101 | -0.6% | 1877.0 | 1109.1 |
+| magma-list-pair-n21 (one pair) | 13.9200 | 13.4161 | -3.6% | 1887.1 | 1887.8 |
+
+The clear gain is beta-ladder: 43% less elapsed time and approximately half the
+peak memory. Mathlib costs 2.3% more elapsed time and 6.8% more peak memory;
+scaling costs 4.7% more time and 4.0% more peak memory. The three-pair pushforward
+sample increased by 21 ms (18.7%), prompting a separate 15-pair comparison after
+two warmups per executable. That follow-up measured 0.1361 s baseline and
+0.1351 s hybrid: the apparent slowdown did not reproduce. Both reports
+retain every run; this short process-level measurement has substantial variation.
+See `automation/measurements/nbe-pushforward-repeat.json` for the follow-up.
+Other compact timings do not demonstrate a broad improvement in recursive
+computation. The hybrid is retained as a bounded improvement for substitution
+pressure, with those measured tradeoffs explicit.
+
+Raw reports: `automation/measurements/nbe-large-final.json`,
+`nbe-stress-final.json`, and `nbe-long-stress-final.json`. These preserve all
+warmups, measured runs, CPU/memory data, command lines, and source/input hashes.
+
+Final validation: 107/107 ReleaseSafe unit tests; 209/209 downloaded compact
+Arena good/bad fixtures including perf at four workers; 7/7 local kernel
+fixtures at both one and four workers. The modified quotient proof of False
+continues to reject. Full Mathlib accepted 713,377 declarations / 104,133,755
+imported expression nodes on every warmup and measured run. Scaling accepted
+252,477 declarations, normalization 32,437, and pushforward 4,971. All paired
+runs matched declaration and expression counts, not merely exit status.
+Final source and executable hashes were rechecked against the reports.
+
+Correctness reports are `automation/measurements/nbe-arena-final.json`,
+`nbe-local-j1-final.json`, and `nbe-local-j4-final.json`. Builds, unit tests,
+measurements, and fixtures ran on this Windows machine. No README or other
+human-only file was changed, and no commit was created for this task.
+
+## O9 - 2026-11-09 08:36 EST - sustained closed computation
+
+Replaced O8's 65,536-step speculative NbE cutoff. Closed comparisons with
+Bool.true, Bool.false, Nat or String literals first get a short syntax probe
+(2,048 steps), keeping inexpensive requests off the allocating evaluator.
+If that probe is insufficient, NbE evaluates the original computation to
+completion under the normal configured resource limits. There is no runtime
+NbE work quota and no switch back to substitution merely because a computation
+is long. Ordinary symbolic/proof conversion keeps lazy delta and proof
+irrelevance. Expensive explicit beta/let spines can use environments without
+turning symbolic conversion into eager recursive computation.
+
+The evaluator shares lazy closures, trims captured environments, preserves
+application spines and native operations, memoizes function prefixes, and
+reclaims unreachable values with weak interning. Lambda telescopes are bound
+without constructing intermediate syntax. Proof arguments are omitted only
+when their declared signatures establish Prop; observing or quoting an omitted
+proof retries the original term in the existing kernel. Type arguments are not
+erased. K reduction and structure eta still use the existing checker.
+
+Frequently called function bodies are weak-head simplified on fresh typed
+locals. This optional preprocessing has its own small budget and retains the
+original body on an unsuccessful probe. It preserves native primitives even
+when their operands are symbolic; otherwise an innocuous comparison of large
+numbers can become structural recursion. The new exported nbe-data fixture
+reproduces that performance failure in the broken prototype and succeeds in
+the corrected build. It also tests direct Nat equality and Bool.false.
+
+Validation: 110/110 ReleaseSafe unit tests; 209/209 compact downloaded Arena
+fixtures; 8/8 local kernel fixtures at both one and four workers. The forged
+Quot.mk-without-Quot.ind proof of False still rejects. Unit tests cover scoped
+readback, unused arguments, universe instances, sparse captures, collection
+and recycled IDs, conservative proof classification, stuck projections,
+strategy switching past 65,536 steps, and restoration of resource limits.
+A ReleaseSafe executable also accepted the full magma-list-deep-n36 input
+(623 declarations) with bounds/overflow checks enabled and passed all eight
+local fixtures. Its local report is nbe-revision-local-checked-final.json.
+
+Three measured runs after one warmup per executable; O8 is the baseline.
+
+| Compact input | O8 median (s) | O9 median (s) | Speedup | O8 peak MiB | O9 peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| app-lam | 7.5066 | 7.4057 | 1.01x | 1011.0 | 1010.3 |
+| beta-ladder | 1.7802 | 1.2288 | 1.45x | 241.2 | 251.9 |
+| let-fold | 0.3025 | 0.2843 | 1.06x | 78.0 | 78.0 |
+| let-ladder | 0.8540 | 0.8719 | 0.98x | 241.1 | 241.1 |
+| magma-list-deep-n21 | 1.5070 | 0.8739 | 1.72x | 125.0 | 28.8 |
+| magma-list-deep-n36 | 53.1120 | 14.2398 | 3.73x | 1109.3 | 33.9 |
+| magma-list-pair-n21 | 14.5759 | 3.4828 | 4.19x | 1889.1 | 29.0 |
+| magma-list-pair-n7 | 1.1218 | 0.3136 | 3.58x | 242.8 | 30.9 |
+
+All 27 perf inputs completed successfully in every warmup and measured run.
+Summing per-case medians gives 81.317 s (O8) versus 29.255 s (O9). This is a
+suite summary, not a claim that every individual input became faster. The
+app-lam case primarily stresses inference/substitution and remains unchanged;
+let-ladder differs by +2.1%. Tiny process timings fluctuate by milliseconds.
+
+Five measured runs after two warmups per executable; direct O8 comparison.
+
+| Large input | O8 median (s) | O9 median (s) | Change | O8 peak MiB | O9 peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mathlib | 11.9978 | 12.0870 | +0.7% | 1335.3 | 1308.1 |
+| scaling-large | 4.2329 | 4.2793 | +1.1% | 633.4 | 617.3 |
+| normalization | 0.5783 | 0.5504 | -4.8% | 131.5 | 126.7 |
+| pushforward | 0.1383 | 0.1433 | +3.6% | 71.7 | 68.2 |
+
+Mathlib differs by +0.7% in this paired comparison, with 2.0% lower peak
+working set. Scaling differs by +1.1%; normalization is 4.8% faster. These
+measurements show no substantial additional proof-workload regression, but
+they do not establish exact performance equality. Pushforward process times
+are noisy (roughly 0.11-0.19 s); its +3.6% median difference is about 5 ms.
+
+For comparison with the checker before any NbE, the separate three-run report
+measured Mathlib at 11.1644 s versus 11.5478 s (+3.4%), with peak working set
+1,252.1 versus 1,315.8 MiB (+5.1%). The earlier hybrid already had overhead
+relative to that baseline; the direct O8 comparison above is the test for
+further regression. This revision does not eliminate all pre-NbE overhead.
+
+Measurements alternate complete processes, use 16 workers, batch size 16,384,
+1 billion steps and 128 million temporary nodes, and retain all warmups and
+outliers. Final executable SHA-256:
+c93ecf49a43f300fee035662d1de12f319c00d772ce599894ab91c1d78a95081.
+Source snapshot: .tools/nbe-revision/final-source.zip. Reports contain source,
+input and executable hashes; full exports accept 713,377 / 252,477 / 32,437 /
+4,971 declarations for Mathlib / scaling / normalization / pushforward.
+
+Reports: automation/measurements/nbe-revision-large-final.json (pre-NbE
+baseline), nbe-revision-previous-large-final.json (O8 baseline),
+nbe-revision-stress-final.json (all 27 compact perf inputs, O8 baseline),
+nbe-revision-arena-final.json, and nbe-revision-local-j1-final.json / j4-final.json.
+All work ran on this Windows machine. Human-only files were not edited.
+The user subsequently requested committing and pushing the validated changes;
+README remains excluded from the agent commit.

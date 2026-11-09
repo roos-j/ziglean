@@ -29,6 +29,15 @@ pub const Checker = struct {
     speculation_limit: ?u64 = null,
     reported: bool = false,
     eager_reduce: bool = false,
+    nbe_enabled: bool = true,
+    nbe_active: bool = false,
+    nbe_blocked: bool = false,
+    // Zero forces eligible requests through NbE for differential unit tests.
+    nbe_min_work: u64 = 32768,
+    nbe_prefer: bool = false,
+    // While simplifying an open function body, preserve native operations so
+    // instantiating it with literals still uses the kernel primitive fast path.
+    preserve_primitives: bool = false,
     pub fn init(m: *expr.Pool, env: *environment.Environment) Checker {
         m.temporary = true;
         return .{ .expressions = m, .environment = env };
@@ -62,6 +71,7 @@ pub const Checker = struct {
         self.speculation_limit = null;
         self.reported = false;
         self.eager_reduce = false;
+        self.nbe_blocked = false;
         self.expressions.temporary = true;
         self.node_start = self.expressions.local.nodes.items.len;
     }

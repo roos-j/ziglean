@@ -1,0 +1,17 @@
+{
+  "description": "Closed Bool.true, Bool.false and Nat computations, including repeated comparison against a large natural. Function-body simplification must preserve native arithmetic.",
+  "outcome": "accept",
+  "source": "nbe-data.lean",
+  "source_sha256": "a3aad5dd082bececd35465205142b4d278b1eb818423693eca81a360042b8e31",
+  "lean": "4.34.0-rc2",
+  "export_command": [
+    ".upstream/export/.lake/build/bin/lean4export.exe",
+    "NbeData",
+    "--",
+    "nbeDataSumCorrect",
+    "nbeDataNat",
+    "nbeDataFalse",
+    "nbeLargeComparisonsCorrect"
+  ],
+  "compilation": "Copy nbe-data.lean to NbeData.lean, compile with Lean, and put its directory on LEAN_PATH for the exporter."
+}

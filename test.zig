@@ -1,4 +1,5 @@
 test {
+    _ = @import("tests/unit/nbe_tests.zig");
     _ = @import("tests/unit/kernel_tests.zig");
     _ = @import("tests/unit/conversion_tests.zig");
     _ = @import("tests/unit/pipeline_tests.zig");

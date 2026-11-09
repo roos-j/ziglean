@@ -165,6 +165,16 @@ fn reduceBig(checker: *Checker, operation: Operation, left_expression: Expr, rig
     return fromBig(checker, result);
 }
 
+pub fn arity(checker: *Checker, function: Expr) ?u2 {
+    const node = checker.expressions.get(function);
+    if (node.kind != .cnst or node.b != 0) return null;
+    if (node.a == checker.environment.builtin("Nat.succ")) return 1;
+    inline for (std.meta.fields(Operation)) |field| {
+        if (node.a == checker.environment.builtin("Nat." ++ field.name)) return 2;
+    }
+    return null;
+}
+
 pub fn reduce(checker: *Checker, function: Expr, arguments: []const Expr) common.Error!?Expr {
     const manager = checker.expressions;
     const node = manager.get(function);

@@ -187,11 +187,12 @@ fn defeqCore(self: *Checker, a: Expr, b: Expr) Error!bool {
             else => {},
         }
     }
-    // Proofs by reflection compare a closed computation with Bool.true. Its
-    // type is already fixed by the other side, so avoid inferring intermediate
-    // dependent recursor types before evaluating the computation.
-    if (initial_right.kind == .cnst and initial_right.a == self.environment.builtin("Bool.true") and (self.eager_reduce or !m.hasFreeVariables(a))) {
-        if (try self.whnf(a) == b) return true;
+    // A literal comparison demands data, unlike ordinary proof conversion.
+    // Finish cheap computations on the syntax path before allocating an evaluator.
+    const literal = initial_right.kind == .nat or initial_right.kind == .str or
+        (initial_right.kind == .cnst and (initial_right.a == self.environment.builtin("Bool.true") or initial_right.a == self.environment.builtin("Bool.false")));
+    if (literal and (self.eager_reduce or !m.hasFreeVariables(a))) {
+        if (try computeLiteral(self, a) == b) return true;
     }
     // Proof irrelevance must precede evaluation of proof terms: proofs can
     // contain enormous computations that conversion has no reason to run.
@@ -335,4 +336,23 @@ fn unfoldHeight(self: *Checker, e: Expr) Error!?u64 {
         };
     }
     return null;
+}
+
+// The small syntax probe only chooses a strategy. Once the computation needs
+// NbE, it runs to completion under the caller's normal resource limits.
+fn computeLiteral(self: *Checker, e: Expr) Error!Expr {
+    if (self.nbe_active or !self.nbe_enabled or self.speculation_limit != null or self.expressions.hasFreeVariables(e)) return self.whnf(e);
+    const previous_prefer = self.nbe_prefer;
+    defer self.nbe_prefer = previous_prefer;
+    const previous_limit = self.speculation_limit;
+    defer self.speculation_limit = previous_limit;
+    self.speculation_limit = @min(self.max_ticks, self.ticks +| 2048);
+    const cheap = self.whnf(e) catch |err| switch (err) {
+        error.SpeculationLimit => null,
+        else => return err,
+    };
+    if (cheap) |result| return result;
+    self.speculation_limit = previous_limit;
+    self.nbe_prefer = true;
+    return self.whnf(e);
 }

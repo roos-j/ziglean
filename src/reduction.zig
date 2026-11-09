@@ -74,7 +74,15 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
     if (!delta and k == .cnst) return e;
     if (k == .fvar and (!delta or m.get(e).c == 0)) return e;
     const ci: usize = @as(usize, if (delta) 1 else if (cheap_projection) 0 else 2) + (if (self.eager_reduce) @as(usize, 3) else 0);
-    if (self.whnf_cache[ci].get(e)) |v| return v;
+    if (!self.preserve_primitives) {
+        if (self.whnf_cache[ci].get(e)) |v| return v;
+    }
+    if (delta or cheap_projection) {
+        if (try @import("nbe.zig").whnf(self, e, delta)) |v| {
+            self.whnf_cache[ci].put(m.allocator, e, v) catch c.oom();
+            return v;
+        }
+    }
     var r = e;
     while (true) {
         try self.tick();
@@ -117,6 +125,7 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
                     continue;
                 }
             }
+            if (self.preserve_primitives and @import("primitive.zig").arity(self, head) != null) break;
             // Delta reduction belongs to the entire application, preserving
             // its argument spine through aliases and typeclass projections.
             var f = try reduceWithProjection(self, head, false, cheap_projection);
@@ -140,6 +149,7 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
             }
         }
         if (delta) {
+            if (self.preserve_primitives and @import("primitive.zig").arity(self, r) != null) break;
             if (try self.unfold(r)) |v| {
                 r = v;
                 continue;
@@ -147,11 +157,11 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
         }
         break;
     }
-    self.whnf_cache[ci].put(m.allocator, e, r) catch c.oom();
+    if (!self.preserve_primitives) self.whnf_cache[ci].put(m.allocator, e, r) catch c.oom();
     return r;
 }
 
-fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
+pub fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
     const m = self.expressions;
     const n = m.get(f);
     if (n.kind != .cnst) return null;

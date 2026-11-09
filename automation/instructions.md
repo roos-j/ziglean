@@ -19,3 +19,9 @@ R9. 2026-11-08 22:23 EST — Fix ziglean so the modified quotient proof-of-False
 R10. 2026-11-08 22:58 EST — Evaluate ziglean against the README's soundness, valid-proof coverage, speed, and memory goals, especially relative to nano-lean. Use measured evidence and explicit trust assumptions; leave README files unchanged.
 
 R11. 2026-11-08 23:05 EST - Commit the evaluation/test reorganization and quotient fix with subject `[codex] Evals; fix quotient bug` and the required Codex coauthor trailer. Exclude README.md and leave its user edits uncommitted.
+
+R12. 2026-11-08 23:12 EST - Implement a hybrid NbE strategy for evaluation-heavy proofs. Preserve kernel correctness and verify against the existing reducer, negative regressions, Arena tests, and paired performance/memory measurements including Mathlib. Do not edit human-only files or commit.
+
+R13. 2026-11-09 06:48 EST - Simplify and correct the NbE strategy: use it for closed computational/data-producing expressions without a fixed speculative work cutoff. Improve computation-heavy Arena cases, especially magma, while avoiding further Mathlib regressions. Compare nano-lean implementation and measure against both pre-NbE and current baselines; preserve soundness, human-only files, and do not commit.
+
+R14. 2026-11-09 08:32 EST - After completing and validating the revised NbE strategy, commit the implementation, tests, and records, then push. Keep README and other human-only files out of the agent commit.
