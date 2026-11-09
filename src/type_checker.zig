@@ -18,7 +18,8 @@ pub const Checker = struct {
     constant_type_cache: Cache(Expr, Expr) = .{},
     unfold_cache: Cache(Expr, Expr) = .{},
     rule_cache: Cache(u64, Expr) = .{},
-    conversion_locals: Cache(u64, Expr) = .{},
+    scoped_locals: Cache(u64, Expr) = .{},
+    substitution_profile: @import("substitution_profile.zig").Profile = .{},
     binder_depth: u32 = 0,
     ticks: u64 = 0,
     max_ticks: u64 = 100_000_000,
@@ -39,7 +40,8 @@ pub const Checker = struct {
         self.constant_type_cache.deinit(self.expressions.allocator);
         self.unfold_cache.deinit(self.expressions.allocator);
         self.rule_cache.deinit(self.expressions.allocator);
-        self.conversion_locals.deinit(self.expressions.allocator);
+        self.scoped_locals.deinit(self.expressions.allocator);
+        self.substitution_profile.deinit(self.expressions.allocator);
     }
     pub fn clearCaches(self: *Checker) void {
         for (&self.infer_cache) |*x| x.clearRetainingCapacity();
@@ -48,10 +50,11 @@ pub const Checker = struct {
         self.constant_type_cache.clearRetainingCapacity();
         self.unfold_cache.clearRetainingCapacity();
         self.rule_cache.clearRetainingCapacity();
-        self.conversion_locals.clearRetainingCapacity();
+        self.scoped_locals.clearRetainingCapacity();
     }
     pub fn beginDeclaration(self: *Checker) void {
         self.clearCaches();
+        self.substitution_profile.beginDeclaration();
         self.params = &.{};
         self.ticks = 0;
         self.depth = 0;
@@ -70,15 +73,19 @@ pub const Checker = struct {
         self.constant_type_cache.trim(allocator);
         self.unfold_cache.trim(allocator);
         self.rule_cache.trim(allocator);
-        self.conversion_locals.trim(allocator);
+        self.scoped_locals.trim(allocator);
     }
-    /// Sibling conversion scopes may share a variable with an identical type.
-    /// Nested scopes use distinct depths, even when their domains are equal.
-    pub fn conversionVariable(self: *Checker, domain: Expr) Expr {
+    /// Sibling inference/conversion scopes may share an identical typed local.
+    /// The caller advances binder_depth while the local is in scope, restores
+    /// it on exit, and abstracts the local from any returned expression. This
+    /// prevents nested binders from aliasing and keeps memoized terms closed
+    /// with respect to the scopes through which their results escape.
+    /// Let-bound values use unique locals because type alone is insufficient.
+    pub fn scopedVariable(self: *Checker, domain: Expr) Expr {
         const key = (@as(u64, self.binder_depth) << 32) | domain;
-        if (self.conversion_locals.get(key)) |variable| return variable;
+        if (self.scoped_locals.get(key)) |variable| return variable;
         const variable = self.expressions.fvar(domain);
-        self.conversion_locals.put(self.expressions.allocator, key, variable) catch c.oom();
+        self.scoped_locals.put(self.expressions.allocator, key, variable) catch c.oom();
         return variable;
     }
     pub inline fn tick(self: *Checker) Error!void {

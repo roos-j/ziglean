@@ -162,19 +162,19 @@ const Gen = struct {
         const head = self.expressions.get(self.expressions.unfoldApps(expression, &arguments));
         if (head.kind != .cnst or self.idx(head.a) != null) return false;
         const container = self.checker.environment.find(head.a) orelse return false;
-        if (container.kind != .inductive or arguments.items.len != container.num_params + container.num_indices) return false;
-        const parameters = arguments.items[0..container.num_params];
+        if (container.kind != .inductive or arguments.items.len != container.details.num_params + container.details.num_indices) return false;
+        const parameters = arguments.items[0..container.details.num_params];
         var nested = false;
         for (parameters) |parameter| {
             if (!self.onlyParameters(parameter) or self.expressions.get(parameter).range != 0) return error.InvalidInductive;
             nested = nested or self.occurs(parameter);
         }
         if (!nested) return false;
-        for (arguments.items[container.num_params..]) |index| {
+        for (arguments.items[container.details.num_params..]) |index| {
             if (self.occurs(index)) return error.InvalidInductive;
         }
         // Copy the whole previously checked mutual family, in declaration order.
-        for (container.all) |name| {
+        for (container.details.all) |name| {
             const declaration = self.checker.environment.find(name) orelse return error.InvalidInductive;
             const pattern = self.expressions.apps(self.expressions.cnst(name, head.b), parameters);
             const body_type = try self.checker.infer(pattern, true);
@@ -184,10 +184,10 @@ const Gen = struct {
             self.push(Target, &self.targets, .{
                 .pattern = pattern,
                 .type = body_type,
-                .parameter_count = declaration.num_params,
-                .index_count = declaration.num_indices,
+                .parameter_count = declaration.details.num_params,
+                .index_count = declaration.details.num_indices,
                 .recursor_name = self.checker.environment.child(self.types[0].name, suffix),
-                .constructors = declaration.ctors,
+                .constructors = declaration.details.ctors,
             });
         }
         return true;
@@ -232,7 +232,7 @@ const Gen = struct {
     fn checkTypes(self: *Gen) Error!void {
         const m = self.expressions;
         const checker = self.checker;
-        self.np = self.types[0].num_params;
+        self.np = self.types[0].details.num_params;
         checker.params = self.types[0].params;
         var ls: c.List(u32) = .{};
         for (checker.params, 0..) |p, i| {
@@ -242,13 +242,13 @@ const Gen = struct {
         self.levels = m.list(ls.items);
         for (self.types, 0..) |d, i| {
             if (d.unsafe_) return error.UnsafeDeclaration;
-            if (d.num_params != self.np or !std.mem.eql(u32, d.params, checker.params)) return error.InvalidInductive;
+            if (d.details.num_params != self.np or !std.mem.eql(u32, d.params, checker.params)) return error.InvalidInductive;
             if (checker.environment.find(d.name) != null or checker.environment.find(checker.environment.child(d.name, "rec")) != null) return error.DuplicateDeclaration;
             for (self.types[0..i]) |prev| {
                 if (prev.name == d.name) return error.DuplicateDeclaration;
             }
-            if (d.all.len != self.types.len) return error.InvalidInductive;
-            for (d.all, self.types) |x, y| {
+            if (d.details.all.len != self.types.len) return error.InvalidInductive;
+            for (d.details.all, self.types) |x, y| {
                 if (x != y.name) return error.InvalidInductive;
             }
             _ = try checker.ensure(try checker.infer(d.ty, true), .sort);
@@ -269,14 +269,16 @@ const Gen = struct {
                 r = try checker.whnf(m.inst(n.b, x));
                 count += 1;
             }
-            if (count < self.np or count - self.np != d.num_indices or m.kind(r) != .sort) return error.InvalidInductive;
+            if (count < self.np or count - self.np != d.details.num_indices or m.kind(r) != .sort) return error.InvalidInductive;
             if (i == 0) self.result_level = m.get(r).a else if (!m.levels.equal(self.result_level, m.get(r).a)) return error.InvalidInductive;
         }
         for (self.ctors) |d| try self.uniform(d.ty, 0);
         for (self.types) |d| {
             var safe = d;
-            safe.recursive = true;
-            safe.reflexive = false;
+            var details = d.details.*;
+            details.recursive = true;
+            details.reflexive = false;
+            safe.details = checker.environment.copyDetails(details);
             try checker.environment.add(safe);
         }
         checker.clearCaches();
@@ -286,9 +288,9 @@ const Gen = struct {
                 .pattern = pattern,
                 .type = try checker.infer(pattern, true),
                 .parameter_count = self.np,
-                .index_count = declaration.num_indices,
+                .index_count = declaration.details.num_indices,
                 .recursor_name = checker.environment.child(declaration.name, "rec"),
-                .constructors = declaration.ctors,
+                .constructors = declaration.details.ctors,
             });
         }
     }
@@ -297,7 +299,7 @@ const Gen = struct {
         const checker = self.checker;
         var consumed: usize = 0;
         for (self.types, 0..) |ind, owner| {
-            for (ind.ctors, 0..) |name, ci| {
+            for (ind.details.ctors, 0..) |name, ci| {
                 var found: ?environment.Decl = null;
                 for (self.ctors) |candidate| {
                     if (candidate.name == name) {
@@ -307,7 +309,7 @@ const Gen = struct {
                 }
                 const d = found orelse return error.InvalidInductive;
                 if (d.unsafe_) return error.UnsafeDeclaration;
-                if (d.parent != ind.name or d.ctor_index != ci or d.num_params != self.np or !std.mem.eql(u32, d.params, checker.params)) return error.InvalidInductive;
+                if (d.details.parent != ind.name or d.details.ctor_index != ci or d.details.num_params != self.np or !std.mem.eql(u32, d.params, checker.params)) return error.InvalidInductive;
                 if (checker.environment.find(d.name) != null) return error.DuplicateDeclaration;
                 for (self.cs.items) |prev| {
                     if (prev.decl.name == d.name) return error.DuplicateDeclaration;
@@ -336,7 +338,7 @@ const Gen = struct {
                     r = m.inst(n.b, x);
                     count += 1;
                 }
-                if (count < self.np or fields.items.len != d.num_fields or (try self.validApp(r) orelse return error.InvalidInductive) != owner) return error.InvalidInductive;
+                if (count < self.np or fields.items.len != d.details.num_fields or (try self.validApp(r) orelse return error.InvalidInductive) != owner) return error.InvalidInductive;
                 self.push(Ctor, &self.cs, .{ .decl = d, .base = m.apps(m.cnst(d.name, self.levels), self.params.items), .fields = fields.items, .result = r, .owner = owner });
                 consumed += 1;
             }
@@ -366,13 +368,13 @@ const Gen = struct {
                     self.push(Expr, &fields, variable);
                     constructor_type = m.inst(node.b, variable);
                 }
-                if ((try self.validApp(constructor_type) orelse return error.InvalidInductive) != target_index or fields.items.len != declaration.num_fields) return error.InvalidInductive;
+                if ((try self.validApp(constructor_type) orelse return error.InvalidInductive) != target_index or fields.items.len != declaration.details.num_fields) return error.InvalidInductive;
                 self.push(Ctor, &self.cs, .{ .decl = declaration.*, .base = base, .fields = fields.items, .result = constructor_type, .owner = target_index });
             }
         }
         for (self.types) |d| {
-            if (d.nested != self.targets.items.len - self.types.len) return error.InvalidInductive;
-            if (d.recursive != self.recursive or d.reflexive != self.reflexive) return error.InvalidInductive;
+            if (d.details.nested != self.targets.items.len - self.types.len) return error.InvalidInductive;
+            if (d.details.recursive != self.recursive or d.details.reflexive != self.reflexive) return error.InvalidInductive;
             checker.environment.update(d);
         }
         for (self.cs.items) |ctor| {
@@ -454,7 +456,7 @@ const Gen = struct {
         var generated: c.List(environment.Decl) = .{};
         for (self.targets.items, self.infos.items, 0..) |target_info, info, owner| {
             const d = try self.findRec(target_info.recursor_name);
-            if (d.unsafe_ or d.num_params != self.np or d.num_indices != info.indices.len or d.num_motives != self.targets.items.len or d.num_minors != self.cs.items.len or d.k != self.k or !std.mem.eql(u32, d.params, first.params) or !std.mem.eql(u32, d.all, self.types[0].all)) return error.InvalidRecursor;
+            if (d.unsafe_ or d.details.num_params != self.np or d.details.num_indices != info.indices.len or d.details.num_motives != self.targets.items.len or d.details.num_minors != self.cs.items.len or d.details.k != self.k or !std.mem.eql(u32, d.params, first.params) or !std.mem.eql(u32, d.details.all, self.types[0].details.all)) return error.InvalidRecursor;
             var ty = m.app(m.apps(info.motive, info.indices), info.major);
             ty = m.bind(.pi, self.params.items, m.bind(.pi, self.motives.items, m.bind(.pi, self.minors.items, m.bind(.pi, info.indices, m.bind(.pi, &.{info.major}, ty)))));
             var rules: c.List(environment.Rule) = .{};
@@ -475,11 +477,13 @@ const Gen = struct {
                 }
                 const body = m.apps(m.apps(self.minors.items[ci], ctor.fields), ihs.items);
                 const rhs = m.bind(.lam, self.params.items, m.bind(.lam, self.motives.items, m.bind(.lam, self.minors.items, m.bind(.lam, ctor.fields, body))));
-                self.push(environment.Rule, &rules, .{ .ctor = ctor.decl.name, .fields = ctor.decl.num_fields, .rhs = rhs });
+                self.push(environment.Rule, &rules, .{ .ctor = ctor.decl.name, .fields = ctor.decl.details.num_fields, .rhs = rhs });
             }
             var safe = d;
             safe.ty = ty;
-            safe.rules = rules.items;
+            var details = d.details.*;
+            details.rules = rules.items;
+            safe.details = checker.environment.copyDetails(details);
             self.push(environment.Decl, &generated, safe);
         }
         // Install only derived recursors while comparing the untrusted exports.
@@ -489,8 +493,8 @@ const Gen = struct {
         for (generated.items) |safe| {
             const d = try self.findRec(safe.name);
             _ = try checker.ensure(try checker.infer(d.ty, true), .sort);
-            if (!try checker.defeq(d.ty, safe.ty) or d.rules.len != safe.rules.len) return error.InvalidRecursor;
-            for (d.rules, safe.rules) |actual, expected| {
+            if (!try checker.defeq(d.ty, safe.ty) or d.details.rules.len != safe.details.rules.len) return error.InvalidRecursor;
+            for (d.details.rules, safe.details.rules) |actual, expected| {
                 if (actual.ctor != expected.ctor or actual.fields != expected.fields) return error.InvalidRecursor;
                 // Compare with the independently generated rule, not just its type.
                 // Only generated rules are installed during this conversion.

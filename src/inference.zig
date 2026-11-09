@@ -22,6 +22,8 @@ pub fn checkAgainst(self: *Checker, expression: Expr, expected: Expr) Error!void
     try self.tick();
     self.depth += 1;
     defer self.depth -= 1;
+    const saved_binder_depth = self.binder_depth;
+    defer self.binder_depth = saved_binder_depth;
     var body = expression;
     var type_body = try self.ensure(expected, .pi);
     var variables: c.SmallList(Expr, 16) = .{};
@@ -35,7 +37,8 @@ pub fn checkAgainst(self: *Checker, expression: Expr, expected: Expr) Error!void
             _ = try self.ensure(try self.infer(domain, true), .sort);
             if (!try self.defeq(domain, expected_domain)) return error.TypeMismatch;
         }
-        c.append(Expr, &variables, m.allocator, m.fvar(domain));
+        c.append(Expr, &variables, m.allocator, self.scopedVariable(domain));
+        self.binder_depth += 1;
         body = term.b;
         type_body = type_.b;
     }
@@ -49,6 +52,9 @@ pub fn constType(self: *Checker, e: Expr) Error!Expr {
     const d = self.environment.find(n.a) orelse return error.UnknownConstant;
     if (d.unsafe_) return error.TypeMismatch;
     if (d.params.len != self.expressions.listLen(n.b)) return error.TypeMismatch;
+    // With no universe parameters the declaration already owns the exact
+    // result. Caching this identity only adds lookups and per-worker storage.
+    if (d.params.len == 0) return d.ty;
     const m = self.expressions;
     const key = (@as(u64, n.a) << 32) | n.b;
     // Generated recursors temporarily replace their exported signatures while
@@ -66,9 +72,29 @@ pub fn constType(self: *Checker, e: Expr) Error!Expr {
     const previous_promote = m.promote;
     defer m.promote = previous_promote;
     m.promote = persistent;
-    const result = m.substLevels(d.ty, d.params, us.items);
+    const result = if (self.substitution_profile.enabled)
+        profiledConstType(self, d, key, us.items)
+    else
+        m.substLevels(d.ty, d.params, us.items);
     if (persistent and expr.Pool.isPermanent(result) and m.constant_types.count < 262144) m.constant_types.put(m.allocator, key, result) catch c.oom();
     self.constant_type_cache.put(self.expressions.allocator, e, result) catch c.oom();
+    return result;
+}
+
+fn profiledConstType(self: *Checker, declaration: *const @import("environment.zig").Decl, key: u64, universes: []const u32) Expr {
+    const m = self.expressions;
+    const before_nodes = m.local.nodes.items.len;
+    const result = m.substLevels(declaration.ty, declaration.params, universes);
+    const eligible = expr.Pool.isPermanent(declaration.ty) and !self.environment.overlay.contains(declaration.name);
+    const outcome: @import("substitution_profile.zig").Outcome = if (!eligible)
+        .excluded
+    else if (result == declaration.ty)
+        .identity
+    else if (expr.Pool.isPermanent(result))
+        .permanent
+    else
+        .temporary;
+    self.substitution_profile.record(m.allocator, key, m.local.nodes.items.len - before_nodes, outcome);
     return result;
 }
 
@@ -98,8 +124,8 @@ pub fn infer(self: *Checker, e: Expr, comptime check: bool) Error!Expr {
         .cnst => blk: {
             if (check) {
                 var p = n.b;
-                while (p != 0) : (p = m.lists.items[p][1]) {
-                    if (!m.levels.valid(m.lists.items[p][0], self.params)) return error.UndeclaredUniverse;
+                while (p != 0) : (p = m.listNode(p)[1]) {
+                    if (!m.levels.valid(m.listNode(p)[0], self.params)) return error.UndeclaredUniverse;
                 }
             }
             break :blk try self.constType(e);
@@ -109,7 +135,10 @@ pub fn infer(self: *Checker, e: Expr, comptime check: bool) Error!Expr {
             if (m.kind(n.b) == n.kind) break :blk try inferBindings(self, e, check);
             const dt = if (check) try self.infer(n.a, true) else 0;
             if (check) _ = try self.ensure(dt, .sort);
-            const x = m.fvar(n.a);
+            const saved_binder_depth = self.binder_depth;
+            defer self.binder_depth = saved_binder_depth;
+            const x = self.scopedVariable(n.a);
+            self.binder_depth += 1;
             const bt = try self.infer(m.inst(n.b, x), check);
             if (n.kind == .lam) break :blk m.binder(.pi, n.a, m.abstract(bt, &.{x}));
             const bs = m.get(try self.ensure(bt, .sort));
@@ -126,6 +155,9 @@ pub fn infer(self: *Checker, e: Expr, comptime check: bool) Error!Expr {
                 if (!try self.defeq(n.a, try self.infer(n.b, true))) return error.TypeMismatch;
             }
             const variable = m.letVariable(n.a, n.b);
+            const saved_binder_depth = self.binder_depth;
+            defer self.binder_depth = saved_binder_depth;
+            self.binder_depth += 1;
             const body_type = try self.infer(m.inst(n.c, variable), check);
             break :blk m.inst(m.abstract(body_type, &.{variable}), n.b);
         },
@@ -196,23 +228,49 @@ pub fn projectionType(self: *Checker, n: expr.Node, ty: Expr) Error!Expr {
     const h = m.get(m.unfoldApps(ty, &aa));
     if (h.kind != .cnst or h.a != n.a) return error.InvalidProjection;
     const d = self.environment.find(h.a) orelse return error.UnknownConstant;
-    if (d.kind != .inductive or d.ctors.len != 1) return error.InvalidProjection;
-    const ctor = self.environment.find(d.ctors[0]).?;
-    if (n.b >= ctor.num_fields or aa.items.len != d.num_params + d.num_indices) return error.InvalidProjection;
+    if (d.kind != .inductive or d.details.ctors.len != 1) return error.InvalidProjection;
+    const ctor = self.environment.find(d.details.ctors[0]).?;
+    if (n.b >= ctor.details.num_fields or aa.items.len != d.details.num_params + d.details.num_indices) return error.InvalidProjection;
     var ct = try self.constType(m.cnst(ctor.name, h.b));
-    for (aa.items[0..d.num_params]) |a| {
+    const is_prop = try self.isProp(ty);
+    if (!is_prop) {
+        if (projectionDomain(self, ct, aa.items[0..d.details.num_params], n)) |field| return field;
+    }
+    for (aa.items[0..d.details.num_params]) |a| {
         const p = m.get(try self.ensure(ct, .pi));
         ct = m.inst(p.b, a);
     }
-    const is_prop = try self.isProp(ty);
     for (0..n.b) |i| {
         const p = m.get(try self.ensure(ct, .pi));
         if (m.get(p.b).range > 0 and is_prop and !try self.isProp(p.a)) return error.InvalidProjection;
         ct = m.inst(p.b, m.mk(.proj, n.a, @intCast(i), n.c));
     }
     const field = m.get(try self.ensure(ct, .pi)).a;
-    if (try self.isProp(ty) and !try self.isProp(field)) return error.InvalidProjection;
+    if (is_prop and !try self.isProp(field)) return error.InvalidProjection;
     return field;
+}
+
+/// Data projections need only the selected field's type. Traverse a syntactic
+/// constructor telescope without copying its remaining body at every binder,
+/// then instantiate that domain once. Aliases retain the general WHNF path.
+/// Prop projections use that path too, preserving its dependency restrictions.
+fn projectionDomain(self: *Checker, constructor_type: Expr, parameters: []const Expr, projection: expr.Node) ?Expr {
+    const m = self.expressions;
+    var arguments: c.SmallList(Expr, 16) = .{};
+    defer arguments.deinit(m.allocator);
+    var body = constructor_type;
+    for (parameters) |argument| {
+        if (m.kind(body) != .pi) return null;
+        body = m.get(body).b;
+        c.append(Expr, &arguments, m.allocator, argument);
+    }
+    for (0..projection.b) |index| {
+        if (m.kind(body) != .pi) return null;
+        body = m.get(body).b;
+        c.append(Expr, &arguments, m.allocator, m.mk(.proj, projection.a, @intCast(index), projection.c));
+    }
+    if (m.kind(body) != .pi) return null;
+    return m.instantiateReverse(m.get(body).a, arguments.items);
 }
 
 pub fn isProp(self: *Checker, e: Expr) Error!bool {
@@ -225,6 +283,8 @@ pub fn isProp(self: *Checker, e: Expr) Error!bool {
 /// when rebuilding the inferred function type.
 fn inferBindings(self: *Checker, expression: Expr, comptime check: bool) Error!Expr {
     const m = self.expressions;
+    const saved_binder_depth = self.binder_depth;
+    defer self.binder_depth = saved_binder_depth;
     const kind = m.kind(expression);
     var domains: c.SmallList(Expr, 16) = .{};
     defer domains.deinit(m.allocator);
@@ -241,7 +301,8 @@ fn inferBindings(self: *Checker, expression: Expr, comptime check: bool) Error!E
             c.append(u32, &levels, m.allocator, sort.a);
         }
         c.append(Expr, &domains, m.allocator, node.a);
-        c.append(Expr, &variables, m.allocator, m.fvar(domain));
+        c.append(Expr, &variables, m.allocator, self.scopedVariable(domain));
+        self.binder_depth += 1;
         body = node.b;
     }
     var result = try self.infer(m.instantiateReverse(body, variables.items), check);

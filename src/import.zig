@@ -47,7 +47,7 @@ const Refs = struct {
 pub const Importer = struct {
     expressions: *ExprPool,
     environment: *environment.Environment,
-    names: Refs = .{},
+    names: @import("import_refs.zig").Refs = .{},
     levels: Refs = .{},
     exprs: @import("import_refs.zig").Refs = .{},
     lines: u64 = 0,
@@ -58,9 +58,14 @@ pub const Importer = struct {
     max_temporary_nodes: u32 = 64_000_000,
     profile: bool = false,
     check_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    slot_wait_ns: u64 = 0,
+    snapshot_count: usize = 0,
+    peak_snapshot_bytes: usize = 0,
+    substitution_totals: @import("substitution_profile.zig").Totals = .{},
     checker: ?Checker = null,
     threads: u8 = 1,
-    batch_size: u32 = 8192,
+    batch_size: u32 = 16384,
     tasks: c.List(parallel.Task) = .{},
     last_expression_count: usize = 0,
     active: c.List(*parallel.Job) = .{},
@@ -94,6 +99,7 @@ pub const Importer = struct {
         job.join();
         self.check_ns += job.elapsed_ns;
         if (self.profile) {
+            self.substitution_totals.add(job.batch.substitutionTotals());
             var total: u64 = 0;
             var slowest: ?parallel.Task = null;
             for (job.tasks.items) |task| {
@@ -127,8 +133,10 @@ pub const Importer = struct {
                     try self.waitActive(index);
                 } else index += 1;
             }
-            if (self.active.items.len < 4) break;
+            if (self.active.items.len < 2) break;
+            var wait_timer = if (self.profile) std.time.Timer.start() catch unreachable else undefined;
             self.completion.wait();
+            if (self.profile) self.slot_wait_ns += wait_timer.read();
         }
         if (self.workers == null) {
             const workers = self.expressions.allocator.create(std.Thread.Pool) catch c.oom();
@@ -143,15 +151,81 @@ pub const Importer = struct {
                 return left.weight > right.weight;
             }
         }.heavier);
+        var snapshot_timer = if (self.profile) std.time.Timer.start() catch unreachable else undefined;
+        self.environment.enableConcurrentSnapshots();
         const job = parallel.Job.create(self.expressions, self.environment, self.tasks, self.threads, self.max_ticks, self.max_temporary_nodes, &self.completion);
+        if (self.profile) {
+            self.snapshot_ns += snapshot_timer.read();
+            self.snapshot_count += 1;
+        }
         self.tasks = .{};
         c.append(*parallel.Job, &self.active, self.expressions.allocator, job);
+        if (self.profile) {
+            var bytes: usize = 0;
+            var retained: [8]usize = undefined;
+            var retained_count: usize = 0;
+            for (self.active.items) |active| {
+                bytes += active.estimatedOwnedBytes();
+                inline for (.{ "name_map", "string_map" }) |field_name| {
+                    const index = @field(active.environment, field_name);
+                    const storage = index.storageId();
+                    // The importing environment already owns its current
+                    // tables. Count each older table retained by jobs once.
+                    if (storage != 0 and storage != @field(self.environment.*, field_name).storageId() and
+                        std.mem.indexOfScalar(usize, retained[0..retained_count], storage) == null)
+                    {
+                        retained[retained_count] = storage;
+                        retained_count += 1;
+                        bytes += index.allocatedBytes();
+                    }
+                }
+            }
+            self.peak_snapshot_bytes = @max(self.peak_snapshot_bytes, bytes);
+        }
         job.batch.profile = self.profile;
         job.start(self.workers.?);
     }
     pub fn finish(self: *Importer) c.Error!void {
         try self.launch();
         while (self.active.items.len != 0) try self.waitActive(0);
+        if (self.profile) self.profileTables();
+    }
+    fn profileTables(self: *const Importer) void {
+        const env = self.environment;
+        const m = self.expressions;
+        var substitution_totals = self.substitution_totals;
+        if (self.checker) |checker| substitution_totals.add(checker.substitution_profile.totals);
+        substitution_totals.print();
+        std.debug.print("profile: snapshots {d}; creation {d:.3}s; importer slot wait {d:.3}s; peak owned snapshot tables ~{d} bytes\n", .{
+            self.snapshot_count, @as(f64, @floatFromInt(self.snapshot_ns)) / 1e9, @as(f64, @floatFromInt(self.slot_wait_ns)) / 1e9, self.peak_snapshot_bytes,
+        });
+        std.debug.print("profile: table lengths names={d}, strings={d}, declarations={d}, universes={d}, universe_lists={d}\n", .{
+            env.names.items.len, env.strings.items.len, env.decls.items.len, m.levels.nodes.items.len, m.universe_lists.nodes.items.len,
+        });
+        std.debug.print("profile: vector capacity bytes names={d}, strings={d}, declarations={d}, declaration_index={d}, universes={d}, universe_lists={d}\n", .{
+            env.names.capacity * @sizeOf(environment.NameNode), env.strings.capacity * @sizeOf([]const u8),                   env.decls.capacity * @sizeOf(environment.Decl),
+            env.decl_map.capacity * @sizeOf(u32),               m.levels.nodes.capacity * @sizeOf(@import("level.zig").Node), m.universe_lists.nodes.capacity * @sizeOf([2]u32),
+        });
+        std.debug.print("profile: hash capacities names={d}, strings={d}, universes={d}, universe_lists={d}, expression_slots={d}\n", .{
+            env.name_map.capacity(), env.string_map.capacity(), m.levels.map.capacity(), m.universe_lists.map.capacity(), m.global.slots.len,
+        });
+        std.debug.print("profile: indexed table bytes names={d}, strings={d}\n", .{ env.name_map.allocatedBytes(), env.string_map.allocatedBytes() });
+        std.debug.print("profile: imported node storage {d} bytes committed; extra payload storage {d} bytes committed\n", .{ m.global.region.committed, m.global.extra_region.committed });
+        std.debug.print("profile: imported wide ranges {d}, overflow map capacity {d}\n", .{ m.global.wide_ranges.count(), m.global.wide_ranges.capacity() });
+        // Finish has joined every checker before this profile-only scan. Keep
+        // storage experiments' counters entirely off the ordinary import path.
+        var ranges: [5]usize = .{0} ** 5;
+        var kinds: [std.meta.fields(ExprKind).len]usize = .{0} ** std.meta.fields(ExprKind).len;
+        for (0..m.global.nodes.items.len) |index| {
+            const node = m.get(@intCast(index));
+            const bucket: usize = if (node.range < 8) 0 else if (node.range < 15) 1 else if (node.range < 31) 2 else if (node.range < 255) 3 else 4;
+            ranges[bucket] += 1;
+            kinds[@intFromEnum(node.kind)] += 1;
+        }
+        std.debug.print("profile: imported range histogram [0,8)={d}, [8,15)={d}, [15,31)={d}, [31,255)={d}, [255,infinity)={d}\n", .{ ranges[0], ranges[1], ranges[2], ranges[3], ranges[4] });
+        std.debug.print("profile: imported kinds", .{});
+        inline for (std.meta.fields(ExprKind)) |kind| std.debug.print(" {s}={d}", .{ kind.name, kinds[kind.value] });
+        std.debug.print("\n", .{});
     }
     fn finishSync(self: *Importer) c.Error!void {
         if (self.tasks.items.len == 0) return;
@@ -170,8 +244,10 @@ pub const Importer = struct {
             .tasks = self.tasks.items,
             .max_ticks = self.max_ticks,
             .max_temporary_nodes = self.max_temporary_nodes,
+            .profile = self.profile,
         };
         try batch.run(self.threads);
+        if (self.profile) self.substitution_totals.add(batch.substitutionTotals());
         for (self.tasks.items) |task| {
             if (task.failure) |err| {
                 self.last_name = task.name;
@@ -223,7 +299,7 @@ pub const Importer = struct {
         const expression_count = self.exprs.count();
         self.tasks.items[self.tasks.items.len - 1].weight = expression_count - self.last_expression_count;
         self.last_expression_count = expression_count;
-        const target = @max(self.batch_size, @min(65536, self.declarations / 8));
+        const target = @max(self.batch_size, @min(16384, self.declarations / 8));
         if (self.tasks.items.len >= target) try self.launch();
     }
     fn nameRef(self: *Importer, j: J) c.Error!u32 {
@@ -255,7 +331,7 @@ pub const Importer = struct {
         return self.line(parsed.value);
     }
 
-    inline fn scanned(self: *Importer, record: @import("scan.zig").Record, bytes: []const u8) c.Error!void {
+    pub inline fn scanned(self: *Importer, record: @import("scan.zig").Record, bytes: []const u8) c.Error!void {
         self.lines += 1;
         if (!self.header) return error.InvalidInput;
         const m = self.expressions;
@@ -352,25 +428,52 @@ pub const Importer = struct {
                 d.height = if (h == .integer or h == .number_string) try num(h) else try num(try field(h, "height"));
             }
         }
+        var details: environment.Details = .{};
+        var has_details = false;
         inline for (.{ "numParams", "numIndices", "numFields", "numMotives", "numMinors", "numNested", "cidx" }, .{ "num_params", "num_indices", "num_fields", "num_motives", "num_minors", "nested", "ctor_index" }) |key, dest| {
-            if (j.object.get(key)) |v| @field(d, dest) = try num(v);
+            if (j.object.get(key)) |v| {
+                @field(details, dest) = try num(v);
+                has_details = true;
+            }
         }
         inline for (.{ "isRec", "isReflexive", "k" }, .{ "recursive", "reflexive", "k" }) |key, dest| {
-            if (j.object.get(key)) |v| @field(d, dest) = try boolean(v);
+            if (j.object.get(key)) |v| {
+                @field(details, dest) = try boolean(v);
+                has_details = true;
+            }
         }
-        if (j.object.get("induct")) |v| d.parent = try self.nameRef(v);
-        if (j.object.get("all")) |v| d.all = try self.nameRefs(v);
-        if (j.object.get("ctors")) |v| d.ctors = try self.nameRefs(v);
+        if (j.object.get("induct")) |v| {
+            details.parent = try self.nameRef(v);
+            has_details = true;
+        }
+        if (j.object.get("all")) |v| {
+            if (kind == .inductive or kind == .recursor) {
+                details.all = try self.nameRefs(v);
+                has_details = true;
+            } else {
+                // The exporter also emits a singleton group for ordinary
+                // declarations. Only inductive reconstruction uses this list;
+                // still validate every supplied name before discarding it.
+                for (try array(v)) |name| _ = try self.nameRef(name);
+            }
+        }
+        if (j.object.get("ctors")) |v| {
+            details.ctors = try self.nameRefs(v);
+            has_details = true;
+        }
         if (j.object.get("rules")) |v| {
             var rules: c.List(environment.Rule) = .{};
             defer rules.deinit(self.expressions.allocator);
             for (try array(v)) |rule| c.append(environment.Rule, &rules, self.expressions.allocator, .{ .ctor = try self.nameRef(try field(rule, "ctor")), .fields = try num(try field(rule, "nfields")), .rhs = try self.exprRef(try field(rule, "rhs")) });
-            d.rules = self.environment.copy(environment.Rule, rules.items);
+            details.rules = self.environment.copy(environment.Rule, rules.items);
+            has_details = true;
         }
         if (kind == .quotient) {
             const k = try text(try field(j, "kind"));
-            d.quot_kind = if (std.mem.eql(u8, k, "ctor")) .mk else std.meta.stringToEnum(@TypeOf(d.quot_kind), k) orelse return error.InvalidInput;
+            details.quot_kind = if (std.mem.eql(u8, k, "ctor")) .mk else std.meta.stringToEnum(@TypeOf(details.quot_kind), k) orelse return error.InvalidInput;
+            has_details = true;
         }
+        if (has_details) d.details = self.environment.copyDetails(details);
         return d;
     }
     pub fn line(self: *Importer, j: J) c.Error!void {
@@ -450,6 +553,7 @@ pub const Importer = struct {
         };
         if (self.checker == null) self.checker = Checker.init(m, self.environment);
         const tc = &self.checker.?;
+        tc.substitution_profile.enabled = self.profile;
         tc.beginDeclaration();
         tc.max_ticks = self.max_ticks;
         tc.max_temporary_nodes = self.max_temporary_nodes;

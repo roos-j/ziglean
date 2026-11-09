@@ -14,4 +14,8 @@ __pycache__/
 vendor/
 *.log
 benchmarks/
-tests/
+/tests/*
+!/tests/*.zig
+/automation/measurements/
+/claude/
+

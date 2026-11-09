@@ -3,6 +3,7 @@ const LevelPool = @import("level.zig").Pool;
 const ExprPool = @import("expr.zig").Pool;
 const Environment = @import("environment.zig").Environment;
 const Importer = @import("import.zig").Importer;
+const processor_profile = @import("processor_profile.zig");
 
 const Options = struct {
     path: []const u8 = "-",
@@ -10,20 +11,22 @@ const Options = struct {
     max_temporary_nodes: u32 = 64_000_000,
     progress: bool = false,
     profile: bool = false,
+    sync_import: bool = false,
     threads: u8 = 1,
-    batch_size: u32 = 8192,
+    batch_size: u32 = 16384,
 };
 
 fn usage() void {
     std.debug.print(
-        \\Usage: ziglean [-j N] [--batch-size N] [--max-steps N] [--max-temporary-nodes N] [--progress] [--profile] [FILE|-]
+        \\Usage: ziglean [-j N] [--batch-size N] [--max-steps N] [--max-temporary-nodes N] [--progress] [--profile] [--sync-import] [FILE|-]
         \\Checks a lean4export 3.x NDJSON stream.
         \\  --max-steps N  Checking budget per declaration (default: 100000000).
         \\  --max-temporary-nodes N  Scratch expression budget (default: 64000000).
         \\  --progress     Report progress every 10000 declarations.
         \\  --profile      Report phase and batch timings.
+        \\  --sync-import  Parse input on the importing thread.
         \\  -j N           Check declarations with N workers (1..32, default: 1).
-        \\  --batch-size N  Initial parallel batch size, growing adaptively (default: 8192).
+        \\  --batch-size N  Initial parallel batch size, growing adaptively (default: 16384).
         \\Exit 0 accepted, 1 rejected, 2 declined, 3 I/O or command-line error.
         \\
     , .{});
@@ -51,6 +54,8 @@ fn run() !void {
             options.progress = true;
         } else if (std.mem.eql(u8, argument, "--profile")) {
             options.profile = true;
+        } else if (std.mem.eql(u8, argument, "--sync-import")) {
+            options.sync_import = true;
         } else if (std.mem.eql(u8, argument, "-j")) {
             index += 1;
             if (index == args.len) return error.MissingThreadCount;
@@ -96,22 +101,71 @@ fn run() !void {
     defer importer.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var reader = @import("line_reader.zig").LineReader(std.fs.File.Reader, 256 * 1024).init(file.reader(), allocator, 256 * 1024 * 1024);
-    defer reader.deinit();
     var timer = try std.time.Timer.start();
     var next_progress: u64 = 10000;
-    while (try reader.next()) |line| {
-        if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
-        importer.lineBytes(arena.allocator(), line) catch |err| {
-            std.debug.print("{s}: {s} at line {d}, declaration ", .{ if (err == error.Unsupported or err == error.ResourceLimit or err == error.UnsafeDeclaration) "declined" else "rejected", @errorName(err), importer.lines });
-            environment.printName(importer.last_name);
-            std.debug.print("\n", .{});
-            std.process.exit(if (err == error.Unsupported or err == error.ResourceLimit or err == error.UnsafeDeclaration) 2 else 1);
-        };
-        if (arena.state.end_index != 0) _ = arena.reset(.retain_capacity);
-        if (options.progress and importer.declarations >= next_progress) {
-            std.debug.print("{s} {d} declarations; {d} nodes; {d:.1}s\n", .{ if (options.threads > 1) "imported" else "checked", importer.declarations, expressions.global.nodes.items.len, @as(f64, @floatFromInt(timer.read())) / 1e9 });
-            next_progress = importer.declarations + 10000;
+    var topology: processor_profile.Topology = if (options.profile) .init(allocator) else .{};
+    defer if (options.profile) topology.deinit(allocator);
+    var consumer_samples: processor_profile.Sampler = if (options.profile) .init(allocator, &topology) else .{};
+    defer if (options.profile) consumer_samples.deinit(allocator);
+    if (options.profile) consumer_samples.start();
+    const concurrent_input = options.threads > 1 and !options.sync_import and !std.mem.eql(u8, options.path, "-") and (try file.stat()).kind == .file;
+    if (concurrent_input) {
+        var producer_samples: processor_profile.Sampler = if (options.profile) .init(allocator, &topology) else .{};
+        defer if (options.profile) producer_samples.deinit(allocator);
+        const stream = try @import("parsed_stream.zig").Stream(std.fs.File.Reader).create(allocator, file.reader(), .{
+            .profile = options.profile,
+            .processor_sampler = if (options.profile) &producer_samples else null,
+        });
+        defer stream.deinit();
+        while (true) {
+            const batch = stream.next();
+            defer stream.release(batch);
+            if (options.profile) consumer_samples.sample();
+            var items = batch.iterator();
+            while (items.next()) |item| {
+                const result = switch (item) {
+                    .scanned => |value| importer.scanned(value.record(), value.text()),
+                    .json => |value| importer.line(value.*),
+                    .raw => |value| importer.lineBytes(arena.allocator(), value),
+                    .invalid => error.InvalidInput,
+                };
+                result catch |err| reject(&importer, &environment, err);
+                if (arena.state.end_index != 0) _ = arena.reset(.retain_capacity);
+                progress(&importer, options, &timer, &next_progress);
+            }
+            if (options.profile) consumer_samples.sample();
+            if (batch.io_error) |err| return err;
+            if (batch.finished) break;
+        }
+        if (options.profile) {
+            consumer_samples.finish();
+            const input_profile = stream.finish();
+            std.debug.print("profile: input batches={d}; read/parse={d:.3}s; producer wait={d:.3}s; consumer wait={d:.3}s; oversized fallbacks={d}\n", .{
+                input_profile.batches,
+                @as(f64, @floatFromInt(input_profile.read_parse_ns)) / 1e9,
+                @as(f64, @floatFromInt(input_profile.producer_wait_ns)) / 1e9,
+                @as(f64, @floatFromInt(input_profile.consumer_wait_ns)) / 1e9,
+                input_profile.oversized_fallbacks,
+            });
+            topology.print();
+            consumer_samples.print("importer");
+            producer_samples.print("producer");
+        }
+    } else {
+        var reader = @import("line_reader.zig").LineReader(std.fs.File.Reader, 256 * 1024).init(file.reader(), allocator, 256 * 1024 * 1024);
+        defer reader.deinit();
+        if (options.profile) consumer_samples.sample();
+        while (try reader.next()) |line| {
+            if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
+            importer.lineBytes(arena.allocator(), line) catch |err| reject(&importer, &environment, err);
+            if (arena.state.end_index != 0) _ = arena.reset(.retain_capacity);
+            progress(&importer, options, &timer, &next_progress);
+        }
+        if (options.profile) {
+            consumer_samples.sample();
+            consumer_samples.finish();
+            topology.print();
+            consumer_samples.print("synchronous importer");
         }
     }
     if (!importer.header) {
@@ -131,4 +185,19 @@ fn run() !void {
         } else std.debug.print("profile: import {d:.3}s; kernel {d:.3}s\n", .{ @as(f64, @floatFromInt(timer.read() - importer.check_ns)) / 1e9, @as(f64, @floatFromInt(importer.check_ns)) / 1e9 });
     }
     if (options.profile and options.threads == 1) std.debug.print("transforms ns={any}; calls={any}\n", .{ expressions.transform_ns, expressions.transform_calls });
+}
+
+fn reject(importer: *const Importer, environment: *const Environment, err: @import("common.zig").Error) noreturn {
+    const declined = err == error.Unsupported or err == error.ResourceLimit or err == error.UnsafeDeclaration;
+    std.debug.print("{s}: {s} at line {d}, declaration ", .{ if (declined) "declined" else "rejected", @errorName(err), importer.lines });
+    environment.printName(importer.last_name);
+    std.debug.print("\n", .{});
+    std.process.exit(if (declined) 2 else 1);
+}
+
+fn progress(importer: *const Importer, options: Options, timer: *std.time.Timer, next_progress: *u64) void {
+    if (options.progress and importer.declarations >= next_progress.*) {
+        std.debug.print("{s} {d} declarations; {d} nodes; {d:.1}s\n", .{ if (options.threads > 1) "imported" else "checked", importer.declarations, importer.expressions.global.nodes.items.len, @as(f64, @floatFromInt(timer.read())) / 1e9 });
+        next_progress.* = importer.declarations + 10000;
+    }
 }

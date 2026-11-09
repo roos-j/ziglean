@@ -7,7 +7,7 @@ pub fn ExprMap(comptime Value: type) type {
     return struct {
         const Self = @This();
         const Entry = struct { value: Value = undefined, epoch: u32 = 0 };
-        const limit = 16 * 1024;
+        const limit = 32 * 1024;
         dense: []Entry = &.{},
         epoch: u32 = 1,
         sparse: Map(u32, Value) = .{},
@@ -110,7 +110,37 @@ pub fn Map(comptime Key: type, comptime Value: type) type {
             self.* = .{};
         }
         pub fn trim(self: *Self, allocator: std.mem.Allocator) void {
-            if (self.entries.len > 256 * 1024) self.deinit(allocator);
+            if (self.entries.len > 64 * 1024) self.deinit(allocator);
         }
     };
+}
+
+test "dense window boundaries preserve full handles laziness and generation rollover" {
+    const Cache = ExprMap(u32);
+    const boundary: u32 = Cache.limit;
+    var cache: Cache = .{};
+    defer cache.deinit(std.testing.allocator);
+    const imported = [_]u32{ 0, boundary - 1, boundary, 0x7fffffff };
+    for (imported, 0..) |key, index| try cache.put(std.testing.allocator, key, @intCast(index + 1));
+    try std.testing.expectEqual(@as(usize, 0), cache.dense.len);
+    const temporary = [_]u32{ 0x80000000, 0x80000000 + boundary - 1, 0x80000000 + boundary, 0xffffffff };
+    for (temporary, 0..) |key, index| try cache.put(std.testing.allocator, key, @intCast(index + 11));
+    try std.testing.expectEqual(@as(usize, boundary), cache.dense.len);
+    for (imported, 0..) |key, index| try std.testing.expectEqual(@as(u32, @intCast(index + 1)), cache.get(key).?);
+    for (temporary, 0..) |key, index| try std.testing.expectEqual(@as(u32, @intCast(index + 11)), cache.get(key).?);
+    try std.testing.expect(cache.sparse.get(temporary[1]) == null);
+    try std.testing.expectEqual(@as(?u32, 13), cache.sparse.get(temporary[2]));
+    cache.clearRetainingCapacity();
+    for (imported) |key| try std.testing.expect(cache.get(key) == null);
+    for (temporary) |key| try std.testing.expect(cache.get(key) == null);
+    cache.epoch = std.math.maxInt(u32);
+    try cache.put(std.testing.allocator, temporary[1], 99);
+    try cache.put(std.testing.allocator, temporary[2], 100);
+    cache.clearRetainingCapacity();
+    try std.testing.expect(cache.get(temporary[1]) == null);
+    try std.testing.expect(cache.get(temporary[2]) == null);
+    try cache.put(std.testing.allocator, imported[1], 101);
+    try cache.put(std.testing.allocator, temporary[1], 102);
+    try std.testing.expectEqual(@as(?u32, 101), cache.get(imported[1]));
+    try std.testing.expectEqual(@as(?u32, 102), cache.get(temporary[1]));
 }

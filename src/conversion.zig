@@ -13,10 +13,10 @@ pub fn etaExpand(self: *Checker, e: Expr, ty: Expr) Error!?Expr {
     const h = m.get(m.unfoldApps(ty, &aa));
     if (h.kind != .cnst) return null;
     const d = self.environment.find(h.a) orelse return null;
-    if (d.kind != .inductive or d.recursive or d.num_indices != 0 or d.ctors.len != 1 or aa.items.len != d.num_params) return null;
-    const ctor = self.environment.find(d.ctors[0]).?;
+    if (d.kind != .inductive or d.details.recursive or d.details.num_indices != 0 or d.details.ctors.len != 1 or aa.items.len != d.details.num_params) return null;
+    const ctor = self.environment.find(d.details.ctors[0]).?;
     var r = m.apps(m.cnst(ctor.name, h.b), aa.items);
-    for (0..ctor.num_fields) |i| r = m.app(r, m.mk(.proj, d.name, @intCast(i), e));
+    for (0..ctor.details.num_fields) |i| r = m.app(r, m.mk(.proj, d.name, @intCast(i), e));
     return r;
 }
 
@@ -25,8 +25,8 @@ fn sameConst(self: *Checker, a: expr.Node, b: expr.Node) bool {
     var x = a.b;
     var y = b.b;
     while (x != 0 and y != 0) {
-        const xx = self.expressions.lists.items[x];
-        const yy = self.expressions.lists.items[y];
+        const xx = self.expressions.listNode(x);
+        const yy = self.expressions.listNode(y);
         if (!self.expressions.levels.equal(xx[0], yy[0])) return false;
         x = xx[1];
         y = yy[1];
@@ -59,16 +59,20 @@ fn compareBindings(self: *Checker, left: Expr, right: Expr, kind: expr.Kind) Err
     var a = left;
     var b = right;
     while (m.kind(a) == kind and m.kind(b) == kind) {
+        // Both bodies use the same substitution for the binders opened so far.
+        // Identical remaining syntax needs neither instantiation nor inference.
+        if (a == b) return true;
         const x = m.get(a);
         const y = m.get(b);
         const domain = m.instantiateReverse(x.a, variables.items);
         const other_domain = if (x.a == y.a) domain else m.instantiateReverse(y.a, variables.items);
         if (!try self.defeq(domain, other_domain)) return false;
-        c.append(Expr, &variables, m.allocator, self.conversionVariable(domain));
+        c.append(Expr, &variables, m.allocator, self.scopedVariable(domain));
         self.binder_depth += 1;
         a = x.b;
         b = y.b;
     }
+    if (a == b) return true;
     return self.defeq(m.instantiateReverse(a, variables.items), m.instantiateReverse(b, variables.items));
 }
 
@@ -178,7 +182,7 @@ fn defeqCore(self: *Checker, a: Expr, b: Expr) Error!bool {
     if (initial_left.kind == initial_right.kind) {
         switch (initial_left.kind) {
             .sort => return structural(self, a, b),
-            .pi => return compareBindings(self, a, b, .pi),
+            .pi, .lam => return compareBindings(self, a, b, initial_left.kind),
             .nat, .str => return false,
             else => {},
         }
@@ -221,7 +225,7 @@ fn defeqCore(self: *Checker, a: Expr, b: Expr) Error!bool {
         const other = if (nx.kind == .lam) y else x;
         const ot = m.get(try self.whnf(try self.infer(other, false)));
         if (ot.kind != .pi or !try self.defeq(l.a, ot.a)) return false;
-        const v = self.conversionVariable(l.a);
+        const v = self.scopedVariable(l.a);
         self.binder_depth += 1;
         defer self.binder_depth -= 1;
         return self.defeq(m.inst(l.b, v), m.app(other, v));
@@ -251,7 +255,7 @@ fn defeqCore(self: *Checker, a: Expr, b: Expr) Error!bool {
     if (try self.etaExpand(x, ty)) |ex_| {
         const h = m.get(m.head(ex_));
         const ctor = self.environment.find(h.a).?;
-        if (ctor.num_fields == 0) return self.defeq(xt, try self.infer(y, false));
+        if (ctor.details.num_fields == 0) return self.defeq(xt, try self.infer(y, false));
     }
     return false;
 }
@@ -260,6 +264,25 @@ fn certainlyNotProof(self: *Checker, expression: Expr) bool {
     const m = self.expressions;
     const head = m.get(m.head(expression));
     if (head.kind == .sort or head.kind == .pi) return true;
+    if (head.kind == .fvar) {
+        var result_type = head.a;
+        while (m.kind(result_type) == .pi) result_type = m.get(result_type).b;
+        if (m.kind(result_type) == .sort) return true;
+        const result_head = m.get(m.head(result_type));
+        var universe_type = switch (result_head.kind) {
+            .cnst => (self.environment.find(result_head.a) orelse return false).ty,
+            .fvar => result_head.a,
+            // A result depending on a consumed type argument cannot be
+            // classified without substitution. Retain ordinary inference.
+            else => return false,
+        };
+        while (m.kind(universe_type) == .pi) universe_type = m.get(universe_type).b;
+        const universe = m.get(universe_type);
+        // A fixed positive final universe makes every enclosing Pi positive.
+        // Bare parameters and Prop remain unknown, including after arguments
+        // instantiate a polymorphic type to universe zero.
+        return universe.kind == .sort and m.levels.nonzero(universe.a);
+    }
     if (head.kind != .cnst) return false;
     const declaration = self.environment.find(head.a) orelse return false;
     // Derived from the type's syntax and strictly positive result universes.
@@ -270,40 +293,46 @@ fn certainlyNotProof(self: *Checker, expression: Expr) bool {
 fn deltaStep(self: *Checker, left: *Expr, right: *Expr) Error!bool {
     const x = left.*;
     const y = right.*;
-    const ux = try self.unfold(x);
-    const uy = try self.unfold(y);
-    if (ux == null and uy == null) return false;
+    const hx = try unfoldHeight(self, x);
+    const hy = try unfoldHeight(self, y);
+    if (hx == null and hy == null) return false;
     // A projected function can conceal the very same definition on the other
     // side. Expose it before unfolding that definition into expensive recursion.
-    if (ux == null and self.expressions.kind(self.expressions.head(x)) == .proj) {
+    if (hx == null and self.expressions.kind(self.expressions.head(x)) == .proj) {
         const exposed = try self.reduceProjections(x);
         if (exposed != x) {
             left.* = exposed;
             return true;
         }
     }
-    if (uy == null and self.expressions.kind(self.expressions.head(y)) == .proj) {
+    if (hy == null and self.expressions.kind(self.expressions.head(y)) == .proj) {
         const exposed = try self.reduceProjections(y);
         if (exposed != y) {
             right.* = exposed;
             return true;
         }
     }
-    const hx = height(self, x);
-    const hy = height(self, y);
-    if (ux != null and (uy == null or hx >= hy)) left.* = try self.reduce(ux.?, false);
-    if (uy != null and (ux == null or hy >= hx)) right.* = try self.reduce(uy.?, false);
+    // Determine priority before instantiating a definition's body. Unfolding
+    // both sides speculatively can copy a large polymorphic body that is never
+    // needed: reducing the higher-priority side may already make them equal.
+    if (hx != null and (hy == null or hx.? >= hy.?)) left.* = try self.reduce((try self.unfold(x)).?, false);
+    if (hy != null and (hx == null or hy.? >= hx.?)) right.* = try self.reduce((try self.unfold(y)).?, false);
     return true;
 }
 
-fn height(self: *Checker, e: Expr) u64 {
-    const h = self.expressions.get(self.expressions.head(e));
+fn unfoldHeight(self: *Checker, e: Expr) Error!?u64 {
+    const m = self.expressions;
+    const h = m.get(m.head(e));
+    if (h.kind == .fvar) return if (h.c != 0) 0 else null;
     if (h.kind == .cnst) {
-        if (self.environment.find(h.a)) |d| return switch (d.hint_kind) {
+        const d = self.environment.find(h.a) orelse return null;
+        if (d.kind != .definition) return null;
+        if (d.params.len != m.listLen(h.b)) return error.TypeMismatch;
+        return switch (d.hint_kind) {
             .opaque_hint => 0,
             .regular => 1 + @as(u64, d.height),
             .abbrev => @as(u64, 1) << 33,
         };
     }
-    return 0;
+    return null;
 }

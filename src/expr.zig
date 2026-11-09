@@ -27,6 +27,28 @@ pub const Node = extern struct {
 comptime {
     std.debug.assert(@sizeOf(Node) == 20);
 }
+// Common imported terms use two 27-bit payloads, a three-bit kind, one
+// parameter flag and a six-bit range in one aligned word. Kind 7 escapes to
+// an exact Node for larger payloads, third words and uncommon expression kinds.
+// The escape preserves all 32 bits of every logical payload and the range.
+const GlobalNode = extern struct { bits: u64 };
+const ScratchNode = extern struct { a: u32, b: u32, c: u32, metadata: u32 };
+const payload_bits = 27;
+const payload_mask: u32 = (1 << payload_bits) - 1;
+const global_kind_shift = 2 * payload_bits;
+const global_flag_shift = global_kind_shift + 3;
+const global_range_shift = global_flag_shift + 1;
+const global_escape_kind = 7;
+const global_range_sentinel: u32 = 63;
+// Scratch metadata retains its existing full-kind, two-flag and 24-bit range
+// layout. Scratch ranges use an exact overflow map; imported overflows escape.
+const range_shift = 8;
+const wide_range_bit = 1 << 6;
+comptime {
+    std.debug.assert(@sizeOf(GlobalNode) == 8);
+    std.debug.assert(@alignOf(GlobalNode) == 8);
+    std.debug.assert(@sizeOf(ScratchNode) == 16);
+}
 const local_bit: u32 = 0x80000000;
 const param_flag: u8 = 1;
 const fvar_flag: u8 = 2;
@@ -46,7 +68,12 @@ fn Store(comptime scratch: bool) type {
     return struct {
         const Self = @This();
         const Tag = if (scratch) u16 else u8;
-        nodes: c.List(Node) = .{},
+        const StoredNode = if (scratch) ScratchNode else GlobalNode;
+        const range_mask: u32 = std.math.maxInt(u32) >> range_shift;
+        nodes: c.List(StoredNode) = .{},
+        extra_payloads: c.List(Node) = .{},
+        extra_region: @import("reserved_buffer.zig").Buffer = .{ .granularity = 64 * 1024 },
+        wide_ranges: std.AutoHashMapUnmanaged(u32, u32) = .{},
         slots: []u32 = &.{},
         tags: []Tag = &.{},
         epoch: u16 = 0x100,
@@ -57,19 +84,142 @@ fn Store(comptime scratch: bool) type {
         fn deinit(s: *Self, a: std.mem.Allocator) void {
             if (s.owns_nodes) {
                 if (s.virtual) s.region.deinit() else s.nodes.deinit(a);
+                if (s.virtual) s.extra_region.deinit() else s.extra_payloads.deinit(a);
             }
+            s.wide_ranges.deinit(a);
             a.free(s.slots);
             a.free(s.tags);
         }
         fn appendNode(s: *Self, allocator: std.mem.Allocator, node: Node) void {
-            if (!s.virtual) return c.append(Node, &s.nodes, allocator, node);
-            if (s.nodes.items.len == s.nodes.capacity) {
-                s.region.ensure((s.nodes.items.len + 1) * @sizeOf(Node)) catch c.oom();
-                const memory: [*]Node = @ptrCast(@alignCast(s.region.pointer.?));
-                s.nodes.items = memory[0..s.nodes.items.len];
-                s.nodes.capacity = s.region.committed / @sizeOf(Node);
+            if (scratch) {
+                var metadata: u32 = @intFromEnum(node.kind);
+                metadata |= @as(u32, node.flags) << 4;
+                metadata |= @as(u32, @min(node.range, range_mask)) << range_shift;
+                if (node.range > range_mask) {
+                    metadata |= wide_range_bit;
+                    s.wide_ranges.put(allocator, @intCast(s.nodes.items.len), node.range) catch c.oom();
+                }
+                s.appendStored(allocator, .{ .a = node.a, .b = node.b, .c = node.c, .metadata = metadata });
+                return;
             }
-            s.nodes.appendAssumeCapacity(node);
+            // Imported expressions never contain checker-local free variables.
+            std.debug.assert(node.flags & ~@as(u8, param_flag) == 0);
+            const flags = @as(u64, node.flags) << global_flag_shift;
+            const range = @as(u64, @min(node.range, global_range_sentinel)) << global_range_shift;
+            if (@intFromEnum(node.kind) >= global_escape_kind or node.c != 0 or (node.a | node.b) > payload_mask or node.range >= global_range_sentinel) {
+                const index: u32 = @intCast(s.extra_payloads.items.len);
+                s.appendExtra(allocator, node);
+                s.appendStored(allocator, .{ .bits = index | (@as(u64, global_escape_kind) << global_kind_shift) | flags | range });
+                return;
+            }
+            s.appendStored(allocator, .{ .bits = @as(u64, node.a) | (@as(u64, node.b) << payload_bits) |
+                (@as(u64, @intFromEnum(node.kind)) << global_kind_shift) | flags | range });
+        }
+        fn appendStored(s: *Self, allocator: std.mem.Allocator, stored: StoredNode) void {
+            if (!s.virtual) return c.append(StoredNode, &s.nodes, allocator, stored);
+            if (s.nodes.items.len == s.nodes.capacity) {
+                s.region.ensure((s.nodes.items.len + 1) * @sizeOf(StoredNode)) catch c.oom();
+                const memory: [*]StoredNode = @ptrCast(@alignCast(s.region.pointer.?));
+                s.nodes.items = memory[0..s.nodes.items.len];
+                s.nodes.capacity = s.region.committed / @sizeOf(StoredNode);
+            }
+            s.nodes.appendAssumeCapacity(stored);
+        }
+        fn appendBinary(s: *Self, allocator: std.mem.Allocator, comptime kind_: Kind, a: Expr, b: Expr) Expr {
+            comptime std.debug.assert(!scratch and (kind_ == .app or kind_ == .pi or kind_ == .lam));
+            if (s.nodes.items.len >= local_bit - 1) c.oom();
+            const id: u32 = @intCast(s.nodes.items.len);
+            const left_bits = s.nodes.items[a].bits;
+            const right_bits = s.nodes.items[b].bits;
+            const left_range: u32 = @intCast(left_bits >> global_range_shift);
+            const right_range: u32 = @intCast(right_bits >> global_range_shift);
+            const maximum = @max(left_range, right_range);
+            if (maximum == global_range_sentinel or (a | b) > payload_mask) {
+                @branchHint(.unlikely);
+                return s.appendBinaryWide(allocator, kind_, id, a, b);
+            }
+            // Escaped children also retain ordinary range/flag metadata inline.
+            const range = if (kind_ == .app) maximum else @max(left_range, right_range -| 1);
+            const flags = (left_bits | right_bits) & (@as(u64, 1) << global_flag_shift);
+            s.appendStored(allocator, .{ .bits = @as(u64, a) | (@as(u64, b) << payload_bits) |
+                (@as(u64, @intFromEnum(kind_)) << global_kind_shift) | flags | (@as(u64, range) << global_range_shift) });
+            return id;
+        }
+        noinline fn appendBinaryWide(s: *Self, allocator: std.mem.Allocator, comptime kind_: Kind, id: u32, a: Expr, b: Expr) Expr {
+            const left_range = s.scalar(a, "range");
+            const right_range = s.scalar(b, "range");
+            const range = @max(left_range, if (kind_ == .app) right_range else right_range -| 1);
+            s.appendNode(allocator, .{ .kind = kind_, .a = a, .b = b, .range = range, .flags = s.scalar(a, "flags") | s.scalar(b, "flags") });
+            return id;
+        }
+        fn appendExtra(s: *Self, allocator: std.mem.Allocator, payload: Node) void {
+            if (!s.virtual) return c.append(Node, &s.extra_payloads, allocator, payload);
+            if (s.extra_payloads.items.len == s.extra_payloads.capacity) {
+                s.extra_region.ensure((s.extra_payloads.items.len + 1) * @sizeOf(Node)) catch c.oom();
+                const memory: [*]Node = @ptrCast(@alignCast(s.extra_region.pointer.?));
+                s.extra_payloads.items = memory[0..s.extra_payloads.items.len];
+                s.extra_payloads.capacity = s.extra_region.committed / @sizeOf(Node);
+            }
+            s.extra_payloads.appendAssumeCapacity(payload);
+        }
+        inline fn extra(s: *const Self, index: u32) Node {
+            const pointer = &s.extra_payloads.items[index];
+            if (s.virtual) return pointer.*;
+            const source: *const volatile Node = pointer;
+            return .{ .a = source.a, .b = source.b, .c = source.c, .range = source.range, .kind = source.kind, .flags = source.flags, .reserved = source.reserved };
+        }
+        inline fn get(s: *const Self, id: u32) Node {
+            const pointer = &s.nodes.items[id];
+            if (!scratch) {
+                const source: *const volatile GlobalNode = pointer;
+                const bits = if (s.virtual) pointer.bits else source.bits;
+                const kind = (bits >> global_kind_shift) & 7;
+                if (kind == global_escape_kind) return s.extra(@truncate(bits));
+                const range: u32 = @intCast(bits >> global_range_shift);
+                return .{
+                    .a = @intCast(bits & payload_mask),
+                    .b = @intCast((bits >> payload_bits) & payload_mask),
+                    .kind = @enumFromInt(kind),
+                    .flags = @intCast((bits >> global_flag_shift) & 1),
+                    .range = range,
+                };
+            }
+            // Ordinary allocator-backed arrays can move during recursion.
+            // Snapshot their fields before any caller can grow the store.
+            const node: StoredNode = if (s.virtual) pointer.* else blk: {
+                const source: *const volatile StoredNode = pointer;
+                break :blk .{ .a = source.a, .b = source.b, .c = source.c, .metadata = source.metadata };
+            };
+            return .{
+                .a = node.a,
+                .b = node.b,
+                .c = node.c,
+                .range = if (node.metadata & wide_range_bit != 0) s.wide_ranges.get(id).? else node.metadata >> range_shift,
+                .kind = @enumFromInt(node.metadata & 15),
+                .flags = @intCast((node.metadata >> 4) & 3),
+            };
+        }
+        inline fn scalar(s: *const Self, id: u32, comptime field: []const u8) @TypeOf(@field(@as(Node, undefined), field)) {
+            const node = &s.nodes.items[id];
+            if (!scratch) {
+                const bits = node.bits;
+                if (comptime std.mem.eql(u8, field, "flags")) return @intCast((bits >> global_flag_shift) & 1);
+                if (comptime std.mem.eql(u8, field, "range")) {
+                    const range: u32 = @intCast(bits >> global_range_shift);
+                    if (range != global_range_sentinel) return range;
+                    return s.extra(@truncate(bits)).range;
+                }
+                const kind = (bits >> global_kind_shift) & 7;
+                if (kind == global_escape_kind) return @field(s.extra(@truncate(bits)), field);
+                if (comptime std.mem.eql(u8, field, "kind")) return @enumFromInt(kind);
+                if (comptime std.mem.eql(u8, field, "a")) return @intCast(bits & payload_mask);
+                if (comptime std.mem.eql(u8, field, "b")) return @intCast((bits >> payload_bits) & payload_mask);
+                return 0;
+            }
+            if (comptime std.mem.eql(u8, field, "kind")) return @enumFromInt(node.metadata & 15);
+            if (comptime std.mem.eql(u8, field, "flags")) return @intCast((node.metadata >> 4) & 3);
+            if (comptime std.mem.eql(u8, field, "range")) return if (node.metadata & wide_range_bit != 0) s.wide_ranges.get(id).? else node.metadata >> range_shift;
+            return @field(node.*, field);
         }
         pub fn clear(s: *Self) void {
             // Keep the fingerprint and generation in one compact load. Most
@@ -82,6 +232,8 @@ fn Store(comptime scratch: bool) type {
                 }
             } else @memset(s.tags, 0);
             s.nodes.clearRetainingCapacity();
+            s.extra_payloads.clearRetainingCapacity();
+            s.wide_ranges.clearRetainingCapacity();
             s.indexed_count = 0;
         }
         inline fn occupied(s: *const Self, tag: Tag) bool {
@@ -99,7 +251,7 @@ fn Store(comptime scratch: bool) type {
             while (s.occupied(s.tags[i])) : (i = (i + 1) & (s.slots.len - 1)) {
                 if (s.tags[i] == tag) {
                     const id = s.slots[i] - 1;
-                    if (eql(s.nodes.items[id], n)) return id;
+                    if (eql(s.get(id), n)) return id;
                 }
             }
             return null;
@@ -113,7 +265,7 @@ fn Store(comptime scratch: bool) type {
                 while (s.occupied(s.tags[slot])) : (slot = (slot + 1) & (s.slots.len - 1)) {
                     if (s.tags[slot] == tag) {
                         const id = s.slots[slot] - 1;
-                        if (eql(s.nodes.items[id], n)) return id;
+                        if (eql(s.get(id), n)) return id;
                     }
                 }
             }
@@ -124,7 +276,7 @@ fn Store(comptime scratch: bool) type {
                 for (s.slots, s.tags) |entry, old_tag| {
                     if (!s.occupied(old_tag)) continue;
                     const id = entry - 1;
-                    const old = s.nodes.items[id];
+                    const old = s.get(@intCast(id));
                     const old_hash = hash(old);
                     var i: usize = old_hash & (slots.len - 1);
                     while (tags[i] != 0) i = (i + 1) & (slots.len - 1);
@@ -140,9 +292,7 @@ fn Store(comptime scratch: bool) type {
             }
             if (s.nodes.items.len >= local_bit - 1) c.oom();
             const id: u32 = @intCast(s.nodes.items.len);
-            var stored = n;
-            stored.reserved = 1;
-            s.appendNode(a, stored);
+            s.appendNode(a, n);
             s.indexed_count += 1;
             s.slots[slot] = id + 1;
             s.tags[slot] = tag;
@@ -178,13 +328,10 @@ pub const Pool = struct {
     // Instantiation may invoke lifting, but transformations never re-enter
     // their own mode. Each mode therefore owns one reusable work table.
     transform_caches: [std.meta.fields(Mode).len]TransformCache = .{TransformCache{}} ** std.meta.fields(Mode).len,
-    lists: c.List([2]u32) = .{},
-    list_map: std.AutoHashMapUnmanaged([2]u32, u32) = .{},
+    universe_lists: @import("universe_lists.zig").Pool,
     natural_strings: [2]StringPool,
     pub fn init(a: std.mem.Allocator, lm: *LevelPool) Pool {
-        var m: Pool = .{ .allocator = a, .levels = lm, .natural_strings = .{ StringPool.init(a), StringPool.init(a) } };
-        c.append([2]u32, &m.lists, a, .{ 0, 0 });
-        return m;
+        return .{ .allocator = a, .levels = lm, .universe_lists = .init(a), .natural_strings = .{ StringPool.init(a), StringPool.init(a) } };
     }
     pub fn deinit(m: *Pool) void {
         m.constant_types.deinit(m.allocator);
@@ -192,8 +339,7 @@ pub const Pool = struct {
         for (&m.transform_caches) |*cache| cache.deinit(m.allocator);
         if (!m.borrowed) m.global.deinit(m.allocator);
         m.local.deinit(m.allocator);
-        m.lists.deinit(m.allocator);
-        m.list_map.deinit(m.allocator);
+        m.universe_lists.deinit();
         if (!m.borrowed) m.natural_strings[0].deinit();
         m.natural_strings[1].deinit();
     }
@@ -204,18 +350,19 @@ pub const Pool = struct {
             .global = m.global,
             .borrowed = true,
             .promotion_limit = 0,
-            .lists = .fromOwnedSlice(m.allocator.dupe([2]u32, m.lists.items) catch c.oom()),
-            .list_map = m.list_map.clone(m.allocator) catch c.oom(),
+            .universe_lists = m.universe_lists.view(),
             .natural_strings = .{ m.natural_strings[0], StringPool.init(m.allocator) },
         };
     }
     pub fn snapshot(m: *const Pool, levels: *LevelPool) Pool {
         std.debug.assert(m.global.virtual);
         var result = m.fork(levels);
+        result.universe_lists = m.universe_lists.snapshot();
         result.borrowed = false;
         result.global.owns_nodes = false;
         result.global.slots = m.allocator.dupe(u32, m.global.slots) catch c.oom();
         result.global.tags = m.allocator.dupe(u8, m.global.tags) catch c.oom();
+        result.global.wide_ranges = m.global.wide_ranges.clone(m.allocator) catch c.oom();
         const strings = &result.natural_strings[0];
         strings.arena = std.heap.ArenaAllocator.init(m.allocator);
         strings.strings = .fromOwnedSlice(m.allocator.dupe([]const u8, strings.strings.items) catch c.oom());
@@ -224,9 +371,9 @@ pub const Pool = struct {
     }
     pub fn reset(m: *Pool) void {
         for (&m.transform_caches) |*cache| {
-            if (cache.entries.len > 256 * 1024) cache.deinit(m.allocator);
+            if (cache.entries.len > 64 * 1024) cache.deinit(m.allocator);
         }
-        if (m.local.nodes.capacity > 1024 * 1024) {
+        if (m.local.nodes.capacity > 64 * 1024) {
             m.local.deinit(m.allocator);
             m.local = .{ .virtual = true, .region = .{ .granularity = 64 * 1024 } };
         } else m.local.clear();
@@ -248,15 +395,10 @@ pub const Pool = struct {
     // allocator-backed stores, force a scalar snapshot before any growth:
     // an inline struct return can otherwise alias reallocating storage in 0.14.
     pub inline fn get(m: *const Pool, e: Expr) Node {
-        const pointer = if (e & local_bit == 0) &m.global.nodes.items[e] else &m.local.nodes.items[e & ~local_bit];
-        const virtual = if (e & local_bit == 0) m.global.virtual else m.local.virtual;
-        if (virtual) return pointer.*;
-        const node: *const volatile Node = pointer;
-        return .{ .a = node.a, .b = node.b, .c = node.c, .range = node.range, .kind = node.kind, .flags = node.flags };
+        return if (e & local_bit == 0) m.global.get(e) else m.local.get(e & ~local_bit);
     }
     inline fn scalar(m: *const Pool, e: Expr, comptime field: []const u8) @TypeOf(@field(@as(Node, undefined), field)) {
-        const pointer = if (e & local_bit == 0) &m.global.nodes.items[e] else &m.local.nodes.items[e & ~local_bit];
-        return @field(pointer.*, field);
+        return if (e & local_bit == 0) m.global.scalar(e, field) else m.local.scalar(e & ~local_bit, field);
     }
     pub inline fn kind(m: *const Pool, e: Expr) Kind {
         return m.scalar(e, "kind");
@@ -268,13 +410,10 @@ pub const Pool = struct {
         return e & local_bit == 0;
     }
     pub fn cons(m: *Pool, first: u32, tail: u32) u32 {
-        const key = [2]u32{ first, tail };
-        const r = m.list_map.getOrPut(m.allocator, key) catch c.oom();
-        if (r.found_existing) return r.value_ptr.*;
-        const id: u32 = @intCast(m.lists.items.len);
-        r.value_ptr.* = id;
-        c.append([2]u32, &m.lists, m.allocator, key);
-        return id;
+        return m.universe_lists.cons(first, tail);
+    }
+    pub inline fn listNode(m: *const Pool, id: u32) [2]u32 {
+        return m.universe_lists.get(id);
     }
     pub fn list(m: *Pool, values: []const u32) u32 {
         var r: u32 = 0;
@@ -288,14 +427,14 @@ pub const Pool = struct {
     pub fn listLen(m: *const Pool, x: u32) u32 {
         var n: u32 = 0;
         var p = x;
-        while (p != 0) : (p = m.lists.items[p][1]) {
+        while (p != 0) : (p = m.listNode(p)[1]) {
             n += 1;
         }
         return n;
     }
     pub fn listArray(m: *const Pool, x: u32, out: anytype) void {
         var p = x;
-        while (p != 0) : (p = m.lists.items[p][1]) c.append(u32, out, m.allocator, m.lists.items[p][0]);
+        while (p != 0) : (p = m.listNode(p)[1]) c.append(u32, out, m.allocator, m.listNode(p)[0]);
     }
     pub fn mk(m: *Pool, kind_: Kind, a: u32, b: u32, d: u32) Expr {
         var n: Node = .{ .kind = kind_, .a = a, .b = b, .c = d };
@@ -304,8 +443,8 @@ pub const Pool = struct {
             .sort => n.flags = if (m.levels.hasParam(a)) param_flag else 0,
             .cnst => {
                 var p = b;
-                while (p != 0) : (p = m.lists.items[p][1]) {
-                    if (m.levels.hasParam(m.lists.items[p][0])) {
+                while (p != 0) : (p = m.listNode(p)[1]) {
+                    if (m.levels.hasParam(m.listNode(p)[0])) {
                         n.flags = param_flag;
                         break;
                     }
@@ -338,11 +477,15 @@ pub const Pool = struct {
             // Imported terms contain no checker locals. Probing the large
             // permanent interning table for an open local term cannot succeed.
             if (n.flags & fvar_flag == 0 and !local_child) {
-                const composite = switch (kind_) {
-                    .app, .lam, .pi, .letE, .proj => true,
-                    else => false,
+                // A worker's derived universe IDs lie beyond the immutable
+                // imported prefix, so no global leaf can contain them.
+                const lookup_global = if (!m.borrowed) true else switch (kind_) {
+                    .app, .lam, .pi, .letE, .proj => false,
+                    .sort => m.levels.parent == null or a < m.levels.base_length,
+                    .cnst => m.universe_lists.parent == null or b < m.universe_lists.base_length,
+                    else => true,
                 };
-                if (!m.borrowed or !composite) {
+                if (lookup_global) {
                     if (m.global.lookup(n)) |id| return id;
                 }
                 if (m.promote and m.promoted_nodes < m.promotion_limit) {
@@ -372,6 +515,7 @@ pub const Pool = struct {
         return m.mk(.cnst, name, us, 0);
     }
     pub fn app(m: *Pool, f: Expr, a: Expr) Expr {
+        if (m.importing and !m.temporary and (f | a) & local_bit == 0) return m.global.appendBinary(m.allocator, .app, f, a);
         return m.mk(.app, f, a, 0);
     }
     pub fn apps(m: *Pool, f: Expr, args: []const Expr) Expr {
@@ -380,6 +524,7 @@ pub const Pool = struct {
         return r;
     }
     pub fn binder(m: *Pool, comptime k: Kind, ty: Expr, body: Expr) Expr {
+        if (m.importing and !m.temporary and (ty | body) & local_bit == 0) return m.global.appendBinary(m.allocator, k, ty, body);
         return m.mk(k, ty, body, 0);
     }
     pub fn fvar(m: *Pool, ty: Expr) Expr {
@@ -433,7 +578,10 @@ pub const Pool = struct {
                     if (mode == .lift) return m.bvar(n.a + t.values[0]);
                     return e;
                 }
-                const key = @as(u64, e) | (@as(u64, depth) << 32);
+                // Universe substitution does not depend on term binders. Its
+                // expression keys occupy the low word, including local IDs;
+                // the separate high word also namespaces universe-list keys.
+                const key = if (mode == .levels) @as(u64, e) else @as(u64, e) | (@as(u64, depth) << 32);
                 t.visited += 1;
                 if (t.visited > 16) {
                     if (t.cache.get(key)) |v| return v;
@@ -455,17 +603,8 @@ pub const Pool = struct {
                     },
                     .cnst => blk: {
                         if (mode != .levels) break :blk e;
-                        var us: c.SmallList(u32, 8) = .{};
-                        defer us.deinit(m.allocator);
-                        m.listArray(n.b, &us);
-                        var changed = false;
-                        for (us.items) |*u| {
-                            const universe = m.levels.subst(u.*, t.names, t.values);
-                            changed = changed or universe != u.*;
-                            u.* = universe;
-                        }
-                        if (!changed) break :blk e;
-                        break :blk m.cnst(n.a, m.list(us.items));
+                        const universes = t.substUniverseList(n.b);
+                        break :blk if (universes == n.b) e else m.cnst(n.a, universes);
                     },
                     .app, .lam, .pi => blk: {
                         const a = t.go(n.a, depth);
@@ -486,6 +625,27 @@ pub const Pool = struct {
                 };
                 if (t.visited > 16) t.cache.put(m.allocator, key, r);
                 return r;
+            }
+
+            fn substUniverseList(t: *@This(), list_id: u32) u32 {
+                const m = t.m;
+                const key = (@as(u64, 1) << 32) | list_id;
+                // Keep tiny substitutions allocation-free, just as for the
+                // expression memo. Different constants can share this list.
+                const memoize = t.visited > 16;
+                if (memoize) if (t.cache.get(key)) |result| return result;
+                var universes: c.SmallList(u32, 8) = .{};
+                defer universes.deinit(m.allocator);
+                m.listArray(list_id, &universes);
+                var changed = false;
+                for (universes.items) |*universe| {
+                    const result = m.levels.subst(universe.*, t.names, t.values);
+                    changed = changed or result != universe.*;
+                    universe.* = result;
+                }
+                const result = if (changed) m.list(universes.items) else list_id;
+                if (memoize) t.cache.put(m.allocator, key, result);
+                return result;
             }
         };
     }
@@ -555,3 +715,34 @@ pub const Pool = struct {
         return r;
     }
 };
+
+test "packed global words round-trip every payload width and exact range" {
+    const nodes = [_]Node{
+        .{ .kind = .app, .a = payload_mask, .b = payload_mask, .range = 62, .flags = 1 },
+        .{ .kind = .app, .a = payload_mask + 1, .b = 17, .range = 61 },
+        .{ .kind = .pi, .a = 19, .b = payload_mask + 1, .range = 63, .flags = 1 },
+        .{ .kind = .lam, .a = std.math.maxInt(u32), .b = std.math.maxInt(u32), .range = std.math.maxInt(u32), .flags = 1 },
+        .{ .kind = .letE, .a = 23, .b = 29, .c = std.math.maxInt(u32), .range = 64 },
+        .{ .kind = .proj, .a = std.math.maxInt(u32), .b = std.math.maxInt(u32), .c = std.math.maxInt(u32), .range = std.math.maxInt(u32) },
+        .{ .kind = .nat, .a = std.math.maxInt(u32), .b = std.math.maxInt(u32) },
+        .{ .kind = .str, .a = std.math.maxInt(u32) },
+        .{ .kind = .app, .a = 31, .b = 37, .range = 63, .flags = 1 },
+        .{ .kind = .app, .a = 41, .b = 43, .range = std.math.maxInt(u32), .flags = 1 },
+        .{ .kind = .letE, .a = 47, .b = 53, .range = 62 },
+    };
+    inline for (.{ false, true }) |virtual| {
+        var store: Store(false) = .{ .virtual = virtual };
+        defer store.deinit(std.testing.allocator);
+        var ids: [nodes.len]u32 = undefined;
+        for (nodes, &ids) |node, *id| id.* = store.insert(std.testing.allocator, node);
+        for (nodes, ids) |node, id| {
+            try std.testing.expectEqualDeep(node, store.get(id));
+            inline for (.{ "a", "b", "c", "kind", "range", "flags" }) |field| {
+                try std.testing.expectEqual(@field(node, field), store.scalar(id, field));
+            }
+            try std.testing.expectEqual(id, store.insert(std.testing.allocator, node));
+        }
+        try std.testing.expectEqual(@as(usize, 0), store.wide_ranges.count());
+        try std.testing.expectEqual(@as(usize, 9), store.extra_payloads.items.len);
+    }
+}

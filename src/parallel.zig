@@ -6,6 +6,7 @@ const environment = @import("environment.zig");
 const ExprPool = @import("expr.zig").Pool;
 const Checker = @import("type_checker.zig").Checker;
 const LevelPool = @import("level.zig").Pool;
+const SubstitutionTotals = @import("substitution_profile.zig").Totals;
 
 pub const Task = struct {
     first: u32,
@@ -28,6 +29,8 @@ pub const Batch = struct {
     max_ticks: u64,
     max_temporary_nodes: u32,
     profile: bool = false,
+    profile_workers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    substitution_profiles: [32]SubstitutionTotals = undefined,
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -40,6 +43,11 @@ pub const Batch = struct {
         defer env.deinit();
         var checker = Checker.init(&expressions, &env);
         defer checker.deinit();
+        checker.substitution_profile.enabled = self.profile;
+        const profile_index = if (self.profile) self.profile_workers.fetchAdd(1, .monotonic) else 0;
+        defer if (self.profile) {
+            self.substitution_profiles[profile_index] = checker.substitution_profile.totals;
+        };
         checker.max_ticks = self.max_ticks;
         checker.max_temporary_nodes = self.max_temporary_nodes;
         while (!self.failed.load(.monotonic)) {
@@ -84,6 +92,12 @@ pub const Batch = struct {
             started += 1;
         }
     }
+    /// Call only after every worker has joined. Each slot has one writer.
+    pub fn substitutionTotals(self: *const Batch) SubstitutionTotals {
+        var result: SubstitutionTotals = .{};
+        for (self.substitution_profiles[0..self.profile_workers.load(.monotonic)]) |totals| result.add(totals);
+        return result;
+    }
 };
 
 /// Owns the small mutable-table snapshots; the large node array is borrowed at
@@ -126,6 +140,21 @@ pub const Job = struct {
         if (!self.joined) self.group.wait();
         self.joined = true;
     }
+    /// Profile-only estimate of owned tables. Shared node/declaration storage,
+    /// indexed name tables, and string bytes are excluded; hash headers/padding are small
+    /// and omitted, so this is not a replacement for OS peak-memory counters.
+    pub fn estimatedOwnedBytes(self: *const Job) usize {
+        const env = &self.environment;
+        const m = &self.expressions;
+        return @sizeOf(Job) + self.tasks.capacity * @sizeOf(Task) +
+            (if (env.owns_name_storage) env.names.capacity * @sizeOf(environment.NameNode) else 0) +
+            (if (env.owns_string_storage) env.strings.capacity * @sizeOf([]const u8) else 0) +
+            (if (env.owns_declaration_index) env.decl_map.capacity * @sizeOf(u32) else 0) + (if (env.owns_declarations) env.decls.capacity * @sizeOf(environment.Decl) else 0) +
+            self.levels.nodes.capacity * @sizeOf(@import("level.zig").Node) + mapBytes(@import("level.zig").Node, u32, self.levels.map.capacity()) +
+            m.universe_lists.nodes.capacity * @sizeOf([2]u32) + mapBytes([2]u32, u32, m.universe_lists.map.capacity()) +
+            m.global.slots.len * @sizeOf(u32) + m.global.tags.len + mapBytes(u32, u32, m.global.wide_ranges.capacity()) +
+            m.natural_strings[0].strings.capacity * @sizeOf([]const u8) + mapBytes([]const u8, u32, m.natural_strings[0].indices.capacity());
+    }
     pub fn deinit(self: *Job) void {
         self.join();
         const allocator = self.expressions.allocator;
@@ -136,3 +165,8 @@ pub const Job = struct {
         allocator.destroy(self);
     }
 };
+
+fn mapBytes(comptime Key: type, comptime Value: type, capacity: usize) usize {
+    // std.HashMap uses separate key/value arrays and one metadata byte per slot.
+    return capacity * (@sizeOf(Key) + @sizeOf(Value) + 1);
+}

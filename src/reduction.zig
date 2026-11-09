@@ -33,6 +33,7 @@ pub fn unfold(self: *Checker, e: Expr) Error!?Expr {
             return m.apps(value, args.items[arity..]);
         }
     }
+    if (d.params.len == 0) return m.apps(d.value.?, args.items);
     const value = self.unfold_cache.get(f) orelse blk: {
         const key = (@as(u64, n.a) << 32) | n.b;
         if (m.definition_values.get(key)) |result| {
@@ -92,8 +93,8 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
             const h = m.get(m.unfoldApps(s, &aa));
             if (h.kind == .cnst) {
                 if (self.environment.find(h.a)) |d| {
-                    if (d.kind == .ctor and d.parent == n.a and aa.items.len == d.num_params + d.num_fields and n.b < d.num_fields) {
-                        r = aa.items[d.num_params + n.b];
+                    if (d.kind == .ctor and d.details.parent == n.a and aa.items.len == d.details.num_params + d.details.num_fields and n.b < d.details.num_fields) {
+                        r = aa.items[d.details.num_params + n.b];
                         continue;
                     }
                 }
@@ -156,7 +157,7 @@ fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
     if (n.kind != .cnst) return null;
     const d = self.environment.find(n.a) orelse return null;
     if (d.kind == .quotient) {
-        const major: usize = switch (d.quot_kind) {
+        const major: usize = switch (d.details.quot_kind) {
             .lift => 5,
             .ind => 4,
             else => return null,
@@ -170,16 +171,16 @@ fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
         return null;
     }
     if (d.kind != .recursor) return null;
-    const major: usize = d.num_params + d.num_motives + d.num_minors + d.num_indices;
+    const major: usize = d.details.num_params + d.details.num_motives + d.details.num_minors + d.details.num_indices;
     if (args.len <= major) return null;
     var v = try self.whnf(args[major]);
-    if (d.k and d.rules.len == 1) {
+    if (d.details.k and d.details.rules.len == 1) {
         const ty = try self.whnf(try self.infer(v, false));
         var aa: c.SmallList(Expr, 16) = .{};
         defer aa.deinit(m.allocator);
         const h = m.get(m.unfoldApps(ty, &aa));
-        if (h.kind == .cnst and aa.items.len >= d.num_params) {
-            const ctor = m.apps(m.cnst(d.rules[0].ctor, h.b), aa.items[0..d.num_params]);
+        if (h.kind == .cnst and aa.items.len >= d.details.num_params) {
+            const ctor = m.apps(m.cnst(d.details.rules[0].ctor, h.b), aa.items[0..d.details.num_params]);
             if (try self.defeq(try self.infer(ctor, false), ty)) v = ctor;
         }
     }
@@ -197,13 +198,13 @@ fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
         }
     }
     if (h.kind != .cnst) return null;
-    for (d.rules) |rule| {
+    for (d.details.rules) |rule| {
         if (rule.ctor == h.a) {
             const constructor = self.environment.find(rule.ctor) orelse return error.InvalidRecursor;
-            if (aa.items.len != constructor.num_params + rule.fields) return null;
+            if (aa.items.len != constructor.details.num_params + rule.fields) return null;
             if (m.listLen(n.b) != d.params.len) return error.TypeMismatch;
             const key = @as(u64, f) | (@as(u64, rule.ctor) << 32);
-            var rhs = self.rule_cache.get(key) orelse blk: {
+            var rhs = if (d.params.len == 0) rule.rhs else self.rule_cache.get(key) orelse blk: {
                 var us: c.SmallList(u32, 8) = .{};
                 defer us.deinit(m.allocator);
                 m.listArray(n.b, &us);
@@ -211,8 +212,8 @@ fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
                 self.rule_cache.put(m.allocator, key, result) catch c.oom();
                 break :blk result;
             };
-            rhs = m.apps(rhs, args[0 .. d.num_params + d.num_motives + d.num_minors]);
-            rhs = m.apps(rhs, aa.items[constructor.num_params..]);
+            rhs = m.apps(rhs, args[0 .. d.details.num_params + d.details.num_motives + d.details.num_minors]);
+            rhs = m.apps(rhs, aa.items[constructor.details.num_params..]);
             return m.apps(rhs, args[major + 1 ..]);
         }
     }

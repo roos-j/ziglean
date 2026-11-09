@@ -1,13 +1,13 @@
 const std = @import("std");
-const level = @import("level.zig");
-const expr = @import("expr.zig");
-const Environment = @import("environment.zig").Environment;
-const Checker = @import("type_checker.zig").Checker;
-const Importer = @import("import.zig").Importer;
-const primitive = @import("primitive.zig");
+const level = @import("../src/level.zig");
+const expr = @import("../src/expr.zig");
+const Environment = @import("../src/environment.zig").Environment;
+const Checker = @import("../src/type_checker.zig").Checker;
+const Importer = @import("../src/import.zig").Importer;
+const primitive = @import("../src/primitive.zig");
 
 test "canonical record scanner never accepts truncated or malformed JSON" {
-    const scan = @import("scan.zig").scan;
+    const scan = @import("../src/scan.zig").scan;
     const sample = "{\"app\":{\"arg\":12,\"fn\":45},\"ie\":67}";
     const record = scan(sample).?;
     try std.testing.expectEqual(@as(u32, 45), record.a);
@@ -18,7 +18,7 @@ test "canonical record scanner never accepts truncated or malformed JSON" {
         "{\"bvar\":01,\"ie\":0}",         "{\"bvar\":-1,\"ie\":0}",                        "{\"bvar\":4294967296,\"ie\":0}",
         "{\"bvar\":0,\"ie\":0,\"ie\":1}", "{\"const\":{\"name\":0,\"us\":[0,]},\"ie\":0}",
     }) |bytes| try std.testing.expect(scan(bytes) == null);
-    var lines = std.mem.tokenizeScalar(u8, @embedFile("../tests/fixtures/conversion.ndjson"), '\n');
+    var lines = std.mem.tokenizeScalar(u8, @embedFile("fixtures/conversion.ndjson"), '\n');
     var count: usize = 0;
     while (lines.next()) |line| {
         if (scan(line) != null) {
@@ -39,18 +39,18 @@ test "canonical record scanner never accepts truncated or malformed JSON" {
 
 test "line reader handles boundaries, empty records, final fragments and limits" {
     var stream = std.io.fixedBufferStream("a\n\n123456789\nlast");
-    var reader = @import("line_reader.zig").LineReader(@TypeOf(stream.reader()), 3).init(stream.reader(), std.testing.allocator, 9);
+    var reader = @import("../src/line_reader.zig").LineReader(@TypeOf(stream.reader()), 3).init(stream.reader(), std.testing.allocator, 9);
     defer reader.deinit();
     for ([_][]const u8{ "a", "", "123456789", "last" }) |expected| try std.testing.expectEqualStrings(expected, (try reader.next()).?);
     try std.testing.expect(try reader.next() == null);
     var large = std.io.fixedBufferStream("1234567890\n");
-    var limited = @import("line_reader.zig").LineReader(@TypeOf(large.reader()), 3).init(large.reader(), std.testing.allocator, 9);
+    var limited = @import("../src/line_reader.zig").LineReader(@TypeOf(large.reader()), 3).init(large.reader(), std.testing.allocator, 9);
     defer limited.deinit();
     try std.testing.expectError(error.StreamTooLong, limited.next());
 }
 
 test "canonical lambda and let records preserve every reference" {
-    const scanner = @import("scan.zig");
+    const scanner = @import("../src/scan.zig");
     const samples = [_][]const u8{
         "{\"ie\":38,\"lam\":{\"binderInfo\":\"default\",\"body\":1,\"name\":14,\"type\":24}}",
         "{\"lam\":{\"binderInfo\":\"implicit\",\"body\":1,\"name\":14,\"type\":24},\"ie\":38}",
@@ -75,7 +75,7 @@ test "canonical lambda and let records preserve every reference" {
 }
 
 test "direct expression caches separate imported and recycled temporary IDs" {
-    var cache: @import("check_cache.zig").ExprMap(u32) = .{};
+    var cache: @import("../src/check_cache.zig").ExprMap(u32) = .{};
     defer cache.deinit(std.testing.allocator);
     const keys = [_]u32{ 3, 0x80000003, 0x80010000 };
     for (keys, 0..) |key, index| try cache.put(std.testing.allocator, key, @intCast(index));
@@ -89,7 +89,7 @@ test "direct expression caches separate imported and recycled temporary IDs" {
 }
 
 test "virtual storage keeps addresses stable when committing more pages" {
-    var buffer: @import("reserved_buffer.zig").Buffer = .{ .granularity = 64 * 1024 };
+    var buffer: @import("../src/reserved_buffer.zig").Buffer = .{ .granularity = 64 * 1024 };
     defer buffer.deinit();
     try buffer.ensure(1);
     const pointer = buffer.pointer.?;
@@ -101,7 +101,7 @@ test "virtual storage keeps addresses stable when committing more pages" {
 }
 
 test "checker memo generations invalidate reused keys and wrap safely" {
-    var cache: @import("check_cache.zig").Map(u64, bool) = .{};
+    var cache: @import("../src/check_cache.zig").Map(u64, bool) = .{};
     defer cache.deinit(std.testing.allocator);
     for (0..2000) |key| try cache.put(std.testing.allocator, key, key % 2 == 0);
     for (0..2000) |key| try std.testing.expectEqual(key % 2 == 0, cache.get(key).?);
@@ -114,7 +114,7 @@ test "checker memo generations invalidate reused keys and wrap safely" {
 }
 
 test "substitution work tables isolate calls, grow, and handle generation wraparound" {
-    var cache: @import("transform_cache.zig").Cache = .{};
+    var cache: @import("../src/transform_cache.zig").Cache = .{};
     defer cache.deinit(std.testing.allocator);
     for (0..4000) |i| cache.put(std.testing.allocator, i * 3, @intCast(i));
     for (0..4000) |i| try std.testing.expectEqual(@as(u32, @intCast(i)), cache.get(i * 3).?);
@@ -211,8 +211,8 @@ fn checkFixtureThreads(bytes: []const u8, max_steps: u64, threads: u8) !void {
 }
 
 test "parallel views preserve inductive scopes and reject forward references" {
-    try checkFixtureThreads(@embedFile("../tests/fixtures/conversion.ndjson"), 100_000, 4);
-    try checkFixtureThreads(@embedFile("../tests/fixtures/multifunctor.ndjson"), 1_000_000, 4);
+    try checkFixtureThreads(@embedFile("fixtures/conversion.ndjson"), 100_000, 4);
+    try checkFixtureThreads(@embedFile("fixtures/multifunctor.ndjson"), 1_000_000, 4);
     try std.testing.expectError(error.InvalidProjection, checkFixtureThreads(@embedFile("../arena/bad/tutorial/094_projProp6.ndjson"), 100_000, 4));
     const forward =
         \\{"meta":{"format":{"version":"3.1.0"}}}
@@ -227,13 +227,13 @@ test "parallel views preserve inductive scopes and reject forward references" {
 }
 
 test "repeated nested inductive parameters need no global hash-consing" {
-    const fixture = @embedFile("../tests/fixtures/nested.ndjson");
+    const fixture = @embedFile("fixtures/nested.ndjson");
     try checkFixture(fixture);
     try checkFixtureThreads(fixture, 100_000, 4);
 }
 
 test "polymorphic result universes retain proof irrelevance at zero" {
-    const fixture = @embedFile("../tests/fixtures/proof_universes.ndjson");
+    const fixture = @embedFile("fixtures/proof_universes.ndjson");
     try checkFixture(fixture);
     try checkFixtureThreads(fixture, 100_000, 4);
 }
@@ -313,8 +313,8 @@ test "scratch interning generations wrap without reusing stale nodes" {
 }
 
 test "Lean conversion regressions avoid proof evaluation and preserve projected primitives" {
-    try checkFixtureWithBudget(@embedFile("../tests/fixtures/conversion.ndjson"), 100_000);
-    try checkFixture(@embedFile("../tests/fixtures/unit_like.ndjson"));
+    try checkFixtureWithBudget(@embedFile("fixtures/conversion.ndjson"), 100_000);
+    try checkFixture(@embedFile("fixtures/unit_like.ndjson"));
 }
 
 test "projection conversion avoids both unnecessary instance unfolding and discarded fields" {
@@ -323,11 +323,11 @@ test "projection conversion avoids both unnecessary instance unfolding and disca
 }
 
 test "application congruence shares dependent function prefixes" {
-    try checkFixtureWithBudget(@embedFile("../tests/fixtures/multifunctor.ndjson"), 1_000_000);
+    try checkFixtureWithBudget(@embedFile("fixtures/multifunctor.ndjson"), 1_000_000);
 }
 
 test "abbreviation hints preserve symbolic arithmetic in signed ranges" {
-    try checkFixtureWithBudget(@embedFile("../tests/fixtures/signed_range.ndjson"), 1_000_000);
+    try checkFixtureWithBudget(@embedFile("fixtures/signed_range.ndjson"), 1_000_000);
 }
 
 fn expectRejected(bytes: []const u8) !void {
@@ -533,12 +533,12 @@ test "expected-type checking shares lambdas and still rejects a changed type" {
     const identity = expressions.binder(.lam, prop, expressions.bvar(0));
     const expected = expressions.binder(.pi, prop, prop);
     _ = try checker.ensure(try checker.infer(expected, true), .sort);
-    try @import("inference.zig").checkAgainst(&checker, identity, expected);
+    try @import("../src/inference.zig").checkAgainst(&checker, identity, expected);
     const next_local = expressions.next_fvar;
-    try @import("inference.zig").checkAgainst(&checker, identity, expected);
+    try @import("../src/inference.zig").checkAgainst(&checker, identity, expected);
     try std.testing.expectEqual(next_local, expressions.next_fvar);
     const changed = expressions.binder(.pi, prop, expressions.sort(levels.succ(0)));
-    try std.testing.expectError(error.TypeMismatch, @import("inference.zig").checkAgainst(&checker, identity, changed));
+    try std.testing.expectError(error.TypeMismatch, @import("../src/inference.zig").checkAgainst(&checker, identity, changed));
 }
 
 test "conversion variable reuse keeps nested binders distinct" {
