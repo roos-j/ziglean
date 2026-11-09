@@ -2,13 +2,24 @@
 
 This is a Lean 4 kernel checker written in [Zig](https://ziglang.org/).
 
+The goal of this project is to explore capabilities of coding agents in producing
+a "good" kernel checker.
+It should be "correct" in the sense that it does not accept a proof of `False` and accepts as many valid proofs as possible.
+It should be "fast" in some sense, use as little memory as possible, and do so consistently across the whole spectrum of practical use cases.
+
 ## Development record
 
 *Nov 7, 2026.* Codex/GPT-6 Astra (High) was initially instructed to extend the kernel checker of [microlean](https://github.com/roos-j/microlean), a human-written project which implements a certain subset of Lean's type theory in Zig for educational purposes.
-After about 2h, Codex produced an initial ~2.3k lines total passing Mathlib in reasonable time (9m 4s, 4.54 GB on my machine, single threaded).
-Codex was then asked to improve performance by taking inspiration from the current (checked on Nov 7, 2026) fastest kernel checker on Lean kernel arena, [nano-lean](https://github.com/sdiehl/nano-lean). After a few more hours of work,
-Codex produced an implementation passing Mathlib in 17.75s using 3.58 GB peak memory and 16 worker threads on the same machine.
+After about 2h, Codex produced an initial ~2.3k lines total passing Mathlib in reasonable time (9m 4s, 4.54 GB locally on one worker). It also passed all Lean kernel arena tests, including the large ones.
+Codex was then asked to improve performance by taking inspiration from a current (checked on Nov 7, 2026) "fast" kernel checker on Lean kernel arena, [nano-lean](https://github.com/sdiehl/nano-lean). After a few more hours of work,
+Codex produced an implementation passing Mathlib in ~17s using 3.58 GB peak memory and 16 worker threads on the same machine.
 This was about twice as fast as the original implementation on a per-worker basis.
+
+*Nov 8, 2026.* Codex/GPT-6 Astra (Ultra) was instructed to find further optimizations,
+both in terms of speed (local wall time) and peak memory usage, with mathlib as a benchmark. This resulted in a further reduction in both metrics, mainly in peak memory usage, 1.3 GB.
+Codex was then instructed to stress test the checker for undesired behavior.
+A quotient reduction bug was found and fixed, where modifying the export of `axiom-quot-mk` by omitting the unused `Quot.ind` allowed a proof of `False` (also, among the Lean kernel arena checkers that pass `axiom-quot-mk`, one was found that does not pass this modified test). 
+
 
 ## AI-generated content
 
