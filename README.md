@@ -22,7 +22,10 @@ This was about twice as fast as the original implementation on a per-worker basi
 Codex was then instructed to stress test the checker for undesired behavior.
 A quotient reduction bug was found and fixed, where modifying the export of `axiom-quot-mk` by omitting the unused `Quot.ind` allowed a proof of `False` (also, among the Lean kernel arena checkers that pass `axiom-quot-mk`, one was found that does not pass this modified test). 
 
-Codex (GPT-6 Astra High) was instructed to implement an NbE strategy to improve performance on evaluation-heavy use cases. Here Codex displayed a striking lack of common sense, coming up with a fixed-budget strategy on specialized terms with a substitution fallback. This is clearly not what is appropriate for efficiently computing large closed expressions (such as in `magma-list-deep-n21`). Codex was then instructed to fix this.
+Codex (GPT-6 Astra High) was instructed to implement an NbE strategy to improve performance on evaluation-heavy use cases. Here Codex displayed a striking lack of common sense, coming up with a fixed-budget strategy on specialized terms with a substitution fallback. This is clearly not what is appropriate for efficiently computing large closed expressions (such as in `magma-list-deep-n21`). Codex was then instructed to fix this, leading to the expected speedups.
+
+*Nov 9, 2026.* Claude Fable 5.2 Max Ultracode was given the generic instruction to do its best to further improve the checker. It found two soundness bugs and some speedups.
+
 
 ## AI-generated content
 
