@@ -1,0 +1,7 @@
+{
+  "description": "Expected rejection: a proof of False that projects the Bool field out of a proposition. `Owner : (h : P) -> gate h` is a family of propositions because `gate h` K-reduces to Prop for h : P, while the sort of `Owner witness` (witness : Q, with Q convertible to P) stays stuck. A kernel that answers 'not a proposition' for a stuck sort permits the data projection `observe`; proof irrelevance then identifies two inhabitants carrying different Bools. This variant of the Arena's bugs/proj-of-subst-prop inlines the Acc proofs of `b` and `c` instead of abstracting them into auxiliary theorems, so it does not depend on whether the kernel unfolds theorems.",
+  "outcome": "reject",
+  "source": "tests/kernel/sources/ProjOfSubstPropInlined.lean, derived from https://github.com/leanprover/lean-kernel-arena/blob/9505c450316294b58bffcb53c7d8d0aa00a3d144/tests/bugs/proj-of-subst-prop.lean",
+  "toolchain": "Lean 4.34.1, lean4export 3.1.0; generated with debug.skipKernelTC",
+  "regression": "ziglean accepted this file in both sequential and parallel modes (the upstream export was rejected only because its theorems were never unfolded). The official kernel 4.34.1 rejects it with '(kernel) type expected' (leanprover/lean4#14807). The proposition test now requires the sort to be known; it must be rejected, not accepted or declined."
+}

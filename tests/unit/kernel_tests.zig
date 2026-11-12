@@ -354,6 +354,25 @@ test "ordinary axiom named Quot.mk cannot trigger quotient reduction" {
     }
 }
 
+test "quotient eliminators require the genuine quotient type and constructor" {
+    // Same records as the Arena's forged-quot-ind, with the forged eliminator
+    // moved after the ordinary definitions named Quot and Quot.mk.
+    const fixture = @embedFile("../kernel/bad/forged-quot-ind-reordered.ndjson");
+    for ([_]u8{ 1, 4 }) |threads| {
+        try std.testing.expectError(error.TypeMismatch, checkFixtureThreads(fixture, 100_000_000, threads));
+    }
+    try expectRejected(@embedFile("../../arena/bad/bugs/forged-quot-ind.ndjson"));
+}
+
+test "a stuck sort is not mistaken for a data type when projecting" {
+    // Arena bugs/proj-of-subst-prop with its Acc proofs inlined: the sort of
+    // the projected structure does not reduce, and must not count as non-Prop.
+    const fixture = @embedFile("../kernel/bad/proj-of-subst-prop-inlined.ndjson");
+    for ([_]u8{ 1, 4 }) |threads| {
+        try std.testing.expectError(error.ExpectedSort, checkFixtureThreads(fixture, 100_000_000, threads));
+    }
+}
+
 test "Arena forged recursors and dependent data projections are rejected" {
     try std.testing.expectError(error.InvalidProjection, checkFixture(@embedFile("../../arena/bad/tutorial/094_projProp6.ndjson")));
     try expectRejected(@embedFile("../../arena/bad/bugs/rec-missing-ih.ndjson"));

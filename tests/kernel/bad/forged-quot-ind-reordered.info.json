@@ -1,0 +1,9 @@
+{
+  "description": "Expected rejection: Quot and Quot.mk are ordinary definitions (a pair type and its diagonal), and a forged quotient primitive Quot.ind is declared after them. Its type, read against those definitions, is an unsound axiom from which fakeQuotFalse : False follows without any axiom. A quotient eliminator is only admissible when Quot and Quot.mk are the quotient primitives themselves.",
+  "outcome": "reject",
+  "upstream_revision": "9505c450316294b58bffcb53c7d8d0aa00a3d144",
+  "source": "https://github.com/leanprover/lean-kernel-arena/blob/9505c450316294b58bffcb53c7d8d0aa00a3d144/tests/bugs/forged-quot-ind.ndjson",
+  "source_sha256": "00f3560695f79944f1d45a217e12b0ad0aad30e2a5f038c20441783ea8a911bd",
+  "modification": "Move the quot record with kind ind (line 169) after the two def records for Quot and Quot.mk (lines 170-171); every record is otherwise byte-identical.",
+  "regression": "The upstream file is rejected only because its Quot.ind record precedes the definitions it mentions. With this record order ziglean accepted the proof of False in both sequential and parallel modes; the official kernel rejects it. It must be rejected, not accepted or declined."
+}

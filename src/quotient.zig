@@ -15,6 +15,12 @@ pub fn check(self: *Checker, d: environment.Decl) c.Error!void {
     for (d.params, 0..) |p, i| {
         if (std.mem.indexOfScalar(u32, d.params[0..i], p) != null) return error.UndeclaredUniverse;
     }
+    // The expected types below mention `Quot` and `Quot.mk` by name. They only
+    // mean what the quotient rules assume if those names already denote the
+    // quotient primitives themselves: with an ordinary definition named `Quot`
+    // (say, a pair type) the eliminator's type would be an unsound axiom.
+    if (d.details.quot_kind != .type) try requirePrimitive(env, "Quot", .type);
+    if (d.details.quot_kind == .ind) try requirePrimitive(env, "Quot.mk", .mk);
     self.params = d.params;
     const u = m.levels.param(d.params[0]);
     const su = m.sort(u);
@@ -56,4 +62,9 @@ pub fn check(self: *Checker, d: environment.Decl) c.Error!void {
     _ = try self.ensure(try self.infer(d.ty, true), .sort);
     if (!try self.defeq(d.ty, ty)) return error.TypeMismatch;
     try env.add(d);
+}
+
+fn requirePrimitive(env: *environment.Environment, comptime spelling: []const u8, kind: @TypeOf(@as(environment.Details, .{}).quot_kind)) c.Error!void {
+    const declaration = env.find(env.builtin(spelling)) orelse return error.UnknownConstant;
+    if (declaration.kind != .quotient or declaration.details.quot_kind != kind) return error.TypeMismatch;
 }

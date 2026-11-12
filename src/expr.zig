@@ -322,8 +322,8 @@ pub const Pool = struct {
     constant_types: @import("check_cache.zig").Map(u64, Expr) = .{},
     definition_values: @import("check_cache.zig").Map(u64, Expr) = .{},
     profile: bool = false,
-    transform_ns: [4]u64 = .{0} ** 4,
-    transform_calls: [4]u64 = .{0} ** 4,
+    transform_ns: [std.meta.fields(Mode).len]u64 = .{0} ** std.meta.fields(Mode).len,
+    transform_calls: [std.meta.fields(Mode).len]u64 = .{0} ** std.meta.fields(Mode).len,
     next_fvar: u32 = 0,
     // Instantiation may invoke lifting, but transformations never re-enter
     // their own mode. Each mode therefore owns one reusable work table.
@@ -554,24 +554,35 @@ pub const Pool = struct {
         std.mem.reverse(Expr, out.items[start..]);
         return r;
     }
-    const Mode = enum { inst, abstract, levels, lift };
+    /// `inst_levels` substitutes bound variables and universe parameters in one
+    /// traversal; the inserted values themselves are left untouched.
+    const Mode = enum { inst, abstract, levels, lift, inst_levels };
     fn Transform(comptime mode: Mode, comptime reverse: bool) type {
         return struct {
             m: *Pool,
             values: []const u32,
             names: []const u32 = &.{},
+            // Universe arguments of `inst_levels`; `levels` keeps them in `values`.
+            universes: []const u32 = &.{},
             cache: *TransformCache,
             visited: usize = 0,
+            recent_lists: [4][2]u32 = undefined,
+            recent_count: usize = 0,
+            const substitutes_levels = mode == .levels or mode == .inst_levels;
+            inline fn levelValues(t: *const @This()) []const u32 {
+                return if (mode == .levels) t.values else t.universes;
+            }
             fn go(t: *@This(), e: Expr, depth: u32) Expr {
                 const m = t.m;
                 switch (mode) {
                     .inst, .lift => if (m.scalar(e, "range") <= depth) return e,
                     .abstract => if (m.scalar(e, "flags") & fvar_flag == 0) return e,
                     .levels => if (m.scalar(e, "flags") & param_flag == 0) return e,
+                    .inst_levels => if (m.scalar(e, "range") <= depth and m.scalar(e, "flags") & param_flag == 0) return e,
                 }
                 const n = m.get(e);
                 if (n.kind == .bvar) {
-                    if (mode == .inst) {
+                    if (mode == .inst or mode == .inst_levels) {
                         const index = n.a - depth;
                         return if (index < t.values.len) m.lift(t.values[if (reverse) t.values.len - 1 - index else index], depth) else m.bvar(n.a - @as(u32, @intCast(t.values.len)));
                     }
@@ -597,12 +608,12 @@ pub const Pool = struct {
                         break :blk e;
                     },
                     .sort => blk: {
-                        if (mode != .levels) break :blk e;
-                        const universe = m.levels.subst(n.a, t.names, t.values);
+                        if (!substitutes_levels) break :blk e;
+                        const universe = m.levels.subst(n.a, t.names, t.levelValues());
                         break :blk if (universe == n.a) e else m.sort(universe);
                     },
                     .cnst => blk: {
-                        if (mode != .levels) break :blk e;
+                        if (!substitutes_levels) break :blk e;
                         const universes = t.substUniverseList(n.b);
                         break :blk if (universes == n.b) e else m.cnst(n.a, universes);
                     },
@@ -628,8 +639,25 @@ pub const Pool = struct {
             }
 
             fn substUniverseList(t: *@This(), list_id: u32) u32 {
+                // A body mentions few distinct universe lists, usually many
+                // times each. Reuse them without hashing or re-interning.
+                for (t.recent_lists[0..t.recent_count]) |entry| {
+                    if (entry[0] == list_id) return entry[1];
+                }
+                const result = t.substUniverseListSlow(list_id);
+                if (t.recent_count < t.recent_lists.len) {
+                    t.recent_lists[t.recent_count] = .{ list_id, result };
+                    t.recent_count += 1;
+                }
+                return result;
+            }
+
+            fn substUniverseListSlow(t: *@This(), list_id: u32) u32 {
                 const m = t.m;
-                const key = (@as(u64, 1) << 32) | list_id;
+                // Expression keys carry a binder depth in their high word
+                // (zero for pure universe substitution); no depth reaches
+                // this reserved value, which namespaces universe-list keys.
+                const key = (@as(u64, std.math.maxInt(u32)) << 32) | list_id;
                 // Keep tiny substitutions allocation-free, just as for the
                 // expression memo. Different constants can share this list.
                 const memoize = t.visited > 16;
@@ -639,7 +667,7 @@ pub const Pool = struct {
                 m.listArray(list_id, &universes);
                 var changed = false;
                 for (universes.items) |*universe| {
-                    const result = m.levels.subst(universe.*, t.names, t.values);
+                    const result = m.levels.subst(universe.*, t.names, t.levelValues());
                     changed = changed or result != universe.*;
                     universe.* = result;
                 }
@@ -650,12 +678,15 @@ pub const Pool = struct {
         };
     }
     fn transform(m: *Pool, comptime mode: Mode, comptime reverse: bool, e: Expr, values: []const u32, names: []const u32) Expr {
+        return m.transformWith(mode, reverse, e, values, names, &.{});
+    }
+    fn transformWith(m: *Pool, comptime mode: Mode, comptime reverse: bool, e: Expr, values: []const u32, names: []const u32, universes: []const u32) Expr {
         var timer = if (m.profile) std.time.Timer.start() catch unreachable else undefined;
         defer if (m.profile) {
             m.transform_ns[@intFromEnum(mode)] += timer.read();
             m.transform_calls[@intFromEnum(mode)] += 1;
         };
-        var t: Transform(mode, reverse) = .{ .cache = &m.transform_caches[@intFromEnum(mode)], .m = m, .values = values, .names = names };
+        var t: Transform(mode, reverse) = .{ .cache = &m.transform_caches[@intFromEnum(mode)], .m = m, .values = values, .names = names, .universes = universes };
         t.cache.reset();
         return t.go(e, 0);
     }
@@ -705,6 +736,27 @@ pub const Pool = struct {
         if (identity) return e;
         return m.transform(.levels, false, e, us, names);
     }
+    /// Instantiate loose bound variables and universe parameters in a single
+    /// traversal. `values` are in application order (outermost binder first),
+    /// exactly as for `instantiateReverse`, and are inserted unchanged: the
+    /// universe substitution `names := us` applies to `e` only. The result is
+    /// `instantiateReverse(substLevels(e, names, us), values)` without the
+    /// intermediate term, so the binder domains of a consumed telescope and
+    /// the unused parts of a body are never copied.
+    pub fn instantiateLevels(m: *Pool, e: Expr, values: []const Expr, names: []const u32, us: []const u32) Expr {
+        if (names.len == 0 or m.scalar(e, "flags") & param_flag == 0) return m.instantiateReverse(e, values);
+        if (values.len == 0 or m.scalar(e, "range") == 0) return m.substLevels(e, names, us);
+        var identity = true;
+        for (names, us) |name, universe| {
+            const node = m.levels.get(universe);
+            if (node.kind != .param or node.a != name) {
+                identity = false;
+                break;
+            }
+        }
+        if (identity) return m.instantiateReverse(e, values);
+        return m.transformWith(.inst_levels, true, e, values, names, us);
+    }
     pub fn bind(m: *Pool, comptime k: Kind, vars: []const Expr, body: Expr) Expr {
         var r = body;
         var i = vars.len;
@@ -715,6 +767,41 @@ pub const Pool = struct {
         return r;
     }
 };
+
+test "fused instantiation equals universe substitution followed by instantiation" {
+    const allocator = std.testing.allocator;
+    var levels = LevelPool.init(allocator);
+    defer levels.deinit();
+    var m = Pool.init(allocator, &levels);
+    defer m.deinit();
+    m.temporary = true;
+    const u = levels.param(7);
+    const v = levels.param(9);
+    const names = [_]u32{ 7, 9 };
+    const replacements = [_]u32{ levels.succ(0), levels.param(11) };
+    const head = m.cnst(3, m.list(&.{ u, levels.succ(v) }));
+    // The inserted values mention the substituted parameter names. They must
+    // survive unchanged: only the instantiated body's universes are replaced.
+    const values = [_]Expr{ m.cnst(5, m.list(&.{u})), m.app(m.cnst(6, m.list(&.{v})), m.sort(u)) };
+    // fun (y : head #0) => head #1 y (Sort (max u v)) #2, with two loose variables.
+    var body = m.apps(head, &.{ m.bvar(1), m.bvar(0), m.sort(levels.max(u, v)), m.bvar(2) });
+    // Cross the memoization threshold with shared constants and universe
+    // lists at binder depths zero and one (their keys share one table).
+    for (0..40) |index| body = m.app(m.app(head, body), if (index % 2 == 0) m.bvar(1) else m.sort(u));
+    const open = m.binder(.lam, m.app(head, m.bvar(0)), body);
+    const terms = [_]Expr{ open, m.app(open, m.app(head, m.bvar(1))), m.binder(.pi, open, m.app(open, m.bvar(0))), m.bvar(0), m.bvar(1), m.bvar(5), head, m.sort(v) };
+    for (terms) |term| {
+        const expected = m.instantiateReverse(m.substLevels(term, &names, &replacements), &values);
+        try std.testing.expectEqual(expected, m.instantiateLevels(term, &values, &names, &replacements));
+        // Degenerate requests reduce to the single transformations.
+        try std.testing.expectEqual(m.substLevels(term, &names, &replacements), m.instantiateLevels(term, &.{}, &names, &replacements));
+        try std.testing.expectEqual(m.instantiateReverse(term, &values), m.instantiateLevels(term, &values, &.{}, &.{}));
+        try std.testing.expectEqual(m.instantiateReverse(term, &values), m.instantiateLevels(term, &values, &names, &.{ u, v }));
+    }
+    // A substituted variable under a binder is lifted, never universe-substituted.
+    const lifted = m.instantiateLevels(m.binder(.lam, m.sort(u), m.app(m.bvar(1), m.bvar(0))), &.{m.app(m.bvar(0), m.sort(u))}, &names, &replacements);
+    try std.testing.expectEqual(m.binder(.lam, m.sort(levels.succ(0)), m.app(m.app(m.bvar(1), m.sort(u)), m.bvar(0))), lifted);
+}
 
 test "packed global words round-trip every payload width and exact range" {
     const nodes = [_]Node{

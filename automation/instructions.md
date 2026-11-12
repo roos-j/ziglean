@@ -25,3 +25,13 @@ R12. 2026-11-08 23:12 EST - Implement a hybrid NbE strategy for evaluation-heavy
 R13. 2026-11-09 06:48 EST - Simplify and correct the NbE strategy: use it for closed computational/data-producing expressions without a fixed speculative work cutoff. Improve computation-heavy Arena cases, especially magma, while avoiding further Mathlib regressions. Compare nano-lean implementation and measure against both pre-NbE and current baselines; preserve soundness, human-only files, and do not commit.
 
 R14. 2026-11-09 08:32 EST - After completing and validating the revised NbE strategy, commit the implementation, tests, and records, then push. Keep README and other human-only files out of the agent commit.
+
+R15. 2026-11-09 20:31 EST - (Claude) Make a substantial, across-the-board improvement to the checker, using the README's definition of a good checker: never accept a proof of `False`, accept as many valid proofs as possible, and be fast and memory-frugal consistently over the whole range of practical inputs. Follow AGENTS.md and add a CLAUDE.md. No commit was requested.
+
+R16. 2026-11-09 20:56 EST - (Claude) Schedule a recurring session job that re-prompts the agent so the R15 improvement work keeps moving until it is finished.
+
+R17. 2026-11-11 22:40 EST - (Claude) Wrap up the R15 run and report its results in `automation/optimization-log.md`. No commit was requested.
+
+R18. 2026-11-11 22:45 EST - (Claude) Do not rerun tests or measurements for the wrap-up; record what the run already produced, reconstructed from the earlier work and the agents' notes.
+
+R19. 2026-11-11 23:00 EST - (Claude) Commit and push the R15 changes, and leave a note telling future agents to continue and finish the unmerged work in the `claude/r15/work` folder.

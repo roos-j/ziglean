@@ -11,6 +11,7 @@
     "bad_universe": "bad/other/inductive-undeclared-universe.ndjson",
     "recursive": "good/tutorial/122_rtreeRecReduction.ndjson",
     "projection_equal_bases": "good/perf/proj-cheap-struct.ndjson",
-    "projection_equal_fields": "good/perf/proj-lazy-struct.ndjson"
+    "projection_equal_fields": "good/perf/proj-lazy-struct.ndjson",
+    "forged_quotient_eliminator": "bad/bugs/forged-quot-ind.ndjson"
   }
 }

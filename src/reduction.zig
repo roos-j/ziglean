@@ -33,6 +33,20 @@ pub fn unfold(self: *Checker, e: Expr) Error!?Expr {
             return m.apps(value, args.items[arity..]);
         }
     }
+    if (args.items.len != 0) {
+        // Delta and beta in one traversal. Instantiating the universe
+        // parameters of the whole value first would copy every binder domain
+        // of the consumed telescope, only for beta reduction to discard them.
+        var body = d.value.?;
+        var used: usize = 0;
+        while (used < args.items.len and m.kind(body) == .lam) : (used += 1) body = m.get(body).b;
+        if (used != 0) {
+            var us: c.SmallList(u32, 8) = .{};
+            defer us.deinit(m.allocator);
+            m.listArray(n.b, &us);
+            return m.apps(m.instantiateLevels(body, args.items[0..used], d.params, us.items), args.items[used..]);
+        }
+    }
     if (d.params.len == 0) return m.apps(d.value.?, args.items);
     const value = self.unfold_cache.get(f) orelse blk: {
         const key = (@as(u64, n.a) << 32) | n.b;
@@ -92,6 +106,12 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
             continue;
         }
         if (n.kind == .proj) {
+            if (!cheap_projection) {
+                if (try projectDefinition(self, n)) |field| {
+                    r = field;
+                    continue;
+                }
+            }
             // During conversion, compare projection bases before unfolding
             // large structure instances. Full reduction remains eager here.
             var s = if (cheap_projection) try self.reduce(n.c, false) else try self.whnf(n.c);
@@ -161,6 +181,36 @@ fn reduceWithProjection(self: *Checker, e: Expr, comptime delta: bool, comptime 
     return r;
 }
 
+/// `(f args).i` where `f` is a definition `fun xs => C params fields` of the
+/// projected structure: delta, beta and the projection in one step. The field
+/// is selected in the definition's body and only that field is instantiated,
+/// instead of first copying every field of a possibly wide instance.
+fn projectDefinition(self: *Checker, projection: @import("expr.zig").Node) Error!?Expr {
+    const m = self.expressions;
+    var args: c.SmallList(Expr, 16) = .{};
+    defer args.deinit(m.allocator);
+    const head = m.get(m.unfoldApps(projection.c, &args));
+    if (head.kind != .cnst) return null;
+    const d = self.environment.find(head.a) orelse return null;
+    if (d.kind != .definition or d.projection_function) return null;
+    if (d.params.len != m.listLen(head.b)) return error.TypeMismatch;
+    var body = d.value.?;
+    var used: usize = 0;
+    while (used < args.items.len and m.kind(body) == .lam) : (used += 1) body = m.get(body).b;
+    if (used != args.items.len) return null;
+    var fields: c.SmallList(Expr, 16) = .{};
+    defer fields.deinit(m.allocator);
+    const constructor_head = m.get(m.unfoldApps(body, &fields));
+    if (constructor_head.kind != .cnst) return null;
+    const constructor = self.environment.find(constructor_head.a) orelse return null;
+    if (constructor.kind != .ctor or constructor.details.parent != projection.a or projection.b >= constructor.details.num_fields or
+        fields.items.len != constructor.details.num_params + constructor.details.num_fields) return null;
+    var us: c.SmallList(u32, 8) = .{};
+    defer us.deinit(m.allocator);
+    m.listArray(head.b, &us);
+    return m.instantiateLevels(fields.items[constructor.details.num_params + projection.b], args.items, d.params, us.items);
+}
+
 pub fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
     const m = self.expressions;
     const n = m.get(f);
@@ -219,19 +269,29 @@ pub fn reduceRecursor(self: *Checker, f: Expr, args: []const Expr) Error!?Expr {
             const constructor = self.environment.find(rule.ctor) orelse return error.InvalidRecursor;
             if (aa.items.len != constructor.details.num_params + rule.fields) return null;
             if (m.listLen(n.b) != d.params.len) return error.TypeMismatch;
-            const key = @as(u64, f) | (@as(u64, rule.ctor) << 32);
-            var rhs = if (d.params.len == 0) rule.rhs else self.rule_cache.get(key) orelse blk: {
-                var us: c.SmallList(u32, 8) = .{};
-                defer us.deinit(m.allocator);
-                m.listArray(n.b, &us);
-                const result = m.substLevels(rule.rhs, d.params, us.items);
-                self.rule_cache.put(m.allocator, key, result) catch c.oom();
-                break :blk result;
-            };
-            rhs = m.apps(rhs, args[0 .. d.details.num_params + d.details.num_motives + d.details.num_minors]);
-            rhs = m.apps(rhs, aa.items[constructor.details.num_params..]);
-            return m.apps(rhs, args[major + 1 ..]);
+            return try applyRule(self, d, n.b, rule.rhs, args[0 .. d.details.num_params + d.details.num_motives + d.details.num_minors], aa.items[constructor.details.num_params..], args[major + 1 ..]);
         }
     }
     return null;
+}
+
+/// Iota: apply a rule's right-hand side `fun params motives minors fields => body`
+/// to its arguments. The telescope is consumed by one substitution that also
+/// instantiates the recursor's universe parameters, instead of copying the
+/// instantiated rule and beta-reducing the copy afterwards.
+fn applyRule(self: *Checker, recursor: *const @import("environment.zig").Decl, universes: u32, rhs: Expr, prefix: []const Expr, fields: []const Expr, rest: []const Expr) Error!Expr {
+    const m = self.expressions;
+    var supplied: c.SmallList(Expr, 16) = .{};
+    defer supplied.deinit(m.allocator);
+    for (prefix) |argument| c.append(Expr, &supplied, m.allocator, argument);
+    for (fields) |argument| c.append(Expr, &supplied, m.allocator, argument);
+    for (rest) |argument| c.append(Expr, &supplied, m.allocator, argument);
+    var body = rhs;
+    var used: usize = 0;
+    while (used < supplied.items.len and m.kind(body) == .lam) : (used += 1) body = m.get(body).b;
+    var us: c.SmallList(u32, 8) = .{};
+    defer us.deinit(m.allocator);
+    m.listArray(universes, &us);
+    // Without leading binders this is plain universe instantiation.
+    return m.apps(m.instantiateLevels(body, supplied.items[0..used], recursor.params, us.items), supplied.items[used..]);
 }

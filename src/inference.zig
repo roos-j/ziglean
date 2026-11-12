@@ -176,17 +176,25 @@ fn inferApplication(self: *Checker, expression: Expr, comptime check: bool) Erro
     var arguments: c.SmallList(Expr, 16) = .{};
     defer arguments.deinit(m.allocator);
     const head = m.unfoldApps(expression, &arguments);
-    var result = try self.infer(head, check);
+    // The declared type of a universe-polymorphic head is walked as it stands.
+    // Its universe arguments are substituted together with the term arguments,
+    // and only into the domains and the result that are actually needed;
+    // instantiating the whole telescope first would copy it for every use.
+    var universes: c.SmallList(u32, 8) = .{};
+    defer universes.deinit(m.allocator);
+    var names: []const u32 = &.{};
+    var result = try polymorphicHeadType(self, head, check, &names, &universes) orelse try self.infer(head, check);
     var start: usize = 0;
     for (arguments.items, 0..) |argument, index| {
         if (m.kind(result) != .pi) {
-            result = m.instantiateReverse(result, arguments.items[start..index]);
+            result = m.instantiateLevels(result, arguments.items[start..index], names, universes.items);
+            names = &.{};
             result = try self.ensure(result, .pi);
             start = index;
         }
         const function_type = m.get(result);
         if (check) {
-            const domain = m.instantiateReverse(function_type.a, arguments.items[start..index]);
+            const domain = m.instantiateLevels(function_type.a, arguments.items[start..index], names, universes.items);
             if (m.kind(argument) == .lam) {
                 try checkAgainst(self, argument, domain);
                 result = function_type.b;
@@ -207,7 +215,29 @@ fn inferApplication(self: *Checker, expression: Expr, comptime check: bool) Erro
         }
         result = function_type.b;
     }
-    return m.instantiateReverse(result, arguments.items[start..]);
+    return m.instantiateLevels(result, arguments.items[start..], names, universes.items);
+}
+
+/// For an applied constant with universe parameters, return its declared type
+/// with the substitution `names := universes` still pending, after the same
+/// validation that inferring the bare constant performs. Null selects the
+/// ordinary path, which also reports unknown constants.
+fn polymorphicHeadType(self: *Checker, head: Expr, comptime check: bool, names: *[]const u32, universes: *c.SmallList(u32, 8)) Error!?Expr {
+    const m = self.expressions;
+    const n = m.get(head);
+    if (n.kind != .cnst) return null;
+    const d = self.environment.find(n.a) orelse return null;
+    if (d.params.len == 0) return null;
+    if (check) {
+        var p = n.b;
+        while (p != 0) : (p = m.listNode(p)[1]) {
+            if (!m.levels.valid(m.listNode(p)[0], self.params)) return error.UndeclaredUniverse;
+        }
+    }
+    if (d.unsafe_ or d.params.len != m.listLen(n.b)) return error.TypeMismatch;
+    m.listArray(n.b, universes);
+    names.* = d.params;
+    return d.ty;
 }
 
 fn literalType(self: *Checker, name: []const u8) Error!Expr {
@@ -231,11 +261,11 @@ pub fn projectionType(self: *Checker, n: expr.Node, ty: Expr) Error!Expr {
     if (d.kind != .inductive or d.details.ctors.len != 1) return error.InvalidProjection;
     const ctor = self.environment.find(d.details.ctors[0]).?;
     if (n.b >= ctor.details.num_fields or aa.items.len != d.details.num_params + d.details.num_indices) return error.InvalidProjection;
-    var ct = try self.constType(m.cnst(ctor.name, h.b));
     const is_prop = try self.isProp(ty);
     if (!is_prop) {
-        if (projectionDomain(self, ct, aa.items[0..d.details.num_params], n)) |field| return field;
+        if (try projectionDomain(self, ctor, h.b, aa.items[0..d.details.num_params], n)) |field| return field;
     }
+    var ct = try self.constType(m.cnst(ctor.name, h.b));
     for (aa.items[0..d.details.num_params]) |a| {
         const p = m.get(try self.ensure(ct, .pi));
         ct = m.inst(p.b, a);
@@ -250,15 +280,18 @@ pub fn projectionType(self: *Checker, n: expr.Node, ty: Expr) Error!Expr {
     return field;
 }
 
-/// Data projections need only the selected field's type. Traverse a syntactic
+/// Data projections need only the selected field's type. Traverse the declared
 /// constructor telescope without copying its remaining body at every binder,
-/// then instantiate that domain once. Aliases retain the general WHNF path.
-/// Prop projections use that path too, preserving its dependency restrictions.
-fn projectionDomain(self: *Checker, constructor_type: Expr, parameters: []const Expr, projection: expr.Node) ?Expr {
+/// then instantiate that one domain, universe arguments included: a wide
+/// structure's other fields are never copied. Aliases retain the general WHNF
+/// path. Prop projections use that path too, preserving its dependency
+/// restrictions.
+fn projectionDomain(self: *Checker, constructor: *const @import("environment.zig").Decl, universe_list: u32, parameters: []const Expr, projection: expr.Node) Error!?Expr {
     const m = self.expressions;
+    if (constructor.unsafe_ or constructor.params.len != m.listLen(universe_list)) return error.TypeMismatch;
     var arguments: c.SmallList(Expr, 16) = .{};
     defer arguments.deinit(m.allocator);
-    var body = constructor_type;
+    var body = constructor.ty;
     for (parameters) |argument| {
         if (m.kind(body) != .pi) return null;
         body = m.get(body).b;
@@ -270,12 +303,20 @@ fn projectionDomain(self: *Checker, constructor_type: Expr, parameters: []const 
         c.append(Expr, &arguments, m.allocator, m.mk(.proj, projection.a, @intCast(index), projection.c));
     }
     if (m.kind(body) != .pi) return null;
-    return m.instantiateReverse(m.get(body).a, arguments.items);
+    var universes: c.SmallList(u32, 8) = .{};
+    defer universes.deinit(m.allocator);
+    m.listArray(universe_list, &universes);
+    return m.instantiateLevels(m.get(body).a, arguments.items, constructor.params, universes.items);
 }
 
+/// The sort of `e` must be known. Conversion is not transitive, so the sort
+/// of a well-typed type can be stuck (a recursor that rule K reduces for one
+/// proof of an equation and not for another). Answering "not a proposition"
+/// for it would permit a data projection out of what is elsewhere, with the
+/// sort reduced, treated as a proof; a stuck sort is therefore an error.
 pub fn isProp(self: *Checker, e: Expr) Error!bool {
-    const ty = self.expressions.get(try self.whnf(try self.infer(e, false)));
-    return ty.kind == .sort and self.expressions.levels.equal(ty.a, 0);
+    const ty = self.expressions.get(try self.ensure(try self.infer(e, false), .sort));
+    return self.expressions.levels.equal(ty.a, 0);
 }
 
 /// Open a consecutive binder telescope once, rather than copying a large

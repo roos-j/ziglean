@@ -588,3 +588,132 @@ nbe-revision-arena-final.json, and nbe-revision-local-j1-final.json / j4-final.j
 All work ran on this Windows machine. Human-only files were not edited.
 The user subsequently requested committing and pushing the validated changes;
 README remains excluded from the agent commit.
+
+## O10 - 2026-11-11 22:45 EST - (Claude) two soundness fixes; fused instantiation
+
+Run R15 (2026-11-09 20:31 to 2026-11-10 ~10:00 EST), wrapped up at the user's
+request (R17, R18) without rerunning anything: every number below was measured
+during the run and is reconstructed from its records. The run was cut short
+three times by account usage limits, so most of the planned work did not land;
+see "Unmerged work". Nothing was committed.
+
+Baseline: git HEAD 4913b2c, executable SHA-256
+`c93ecf49a43f300fee035662d1de12f319c00d772ce599894ab91c1d78a95081`.
+Result: the working tree, executable SHA-256
+`591198e12e1130e18201208704d16adcbf5bd60edb978231be529e1fff7a92cf`.
+All runs use the Arena configuration `-j 4 --max-steps 1000000000
+--max-temporary-nodes 128000000` on the same Windows/i9-14900K machine, with the
+Arena's own exports (Lean 4.34.1; Mathlib has 718,577 declarations there).
+
+### Soundness
+
+Two axiom-free proofs of `False` were accepted by the baseline in both `-j 1`
+and `-j 4`; the official kernel 4.34.1 rejects both. Both are fixed and have
+regression fixtures with unit tests.
+
+1. Forged quotient eliminator. `quotient.zig` built the expected types of
+   `Quot.mk`/`Quot.lift`/`Quot.ind` from the names `Quot` and `Quot.mk` without
+   checking that those names denote the quotient primitives. The Arena's
+   `bugs/forged-quot-ind` was rejected only because its `Quot.ind` record
+   precedes the ordinary definitions named `Quot` and `Quot.mk`; moving that
+   one record after them made the file pass. Admission now requires `Quot`
+   (and, for `ind`, `Quot.mk`) to be genuine quotient declarations.
+   Fixture: `tests/kernel/bad/forged-quot-ind-reordered.ndjson`.
+2. Stuck sort treated as "not a proposition". `inference.isProp` answered
+   false when a type's sort did not reduce to a sort, permitting a `Bool`
+   projection out of a proof. The Arena's `bugs/proj-of-subst-prop` was
+   rejected only because ziglean never unfolds theorems; with its `Acc` proofs
+   inlined it passed. `isProp` now requires the sort, as lean4#14807 does.
+   Fixture: `tests/kernel/bad/proj-of-subst-prop-inlined.ndjson` (source in
+   `tests/kernel/sources/ProjOfSubstPropInlined.lean`). nano-lean 0.3.3 also
+   rejects this file.
+
+Open item: comparing where ziglean and the official kernel reject each of the
+84 negative tests showed that `bugs/proj-of-subst-prop` and
+`bugs/rec-of-subst-prop` are still rejected at an earlier declaration than the
+official kernel's (`proposition` rather than `observe` / `forallFalse`), i.e.
+partly by accident. The unmerged rules work addresses the cause.
+
+### Speed
+
+`Pool.instantiateLevels` substitutes bound variables and universe parameters
+in one traversal. It is used by delta+beta (`unfold`), iota (`applyRule`),
+projection of a definition whose body is a constructor (`projectDefinition`),
+application typing with a universe-polymorphic head (the declared type is
+walked with the universe substitution pending) and projection typing (only the
+selected field's type is instantiated). No kernel rule changed.
+
+Paired comparison, baseline against the tree before the `isProp` fix and the
+projection fusion: two alternating runs each, pinned to logical CPUs 0-7, while
+other agents were using the machine. Medians; peak is the maximum.
+
+| Input | Base CPU s | New CPU s | CPU | Base wall s | New wall s | Base MiB | New MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mathlib | 140.50 | 117.70 | -16.2% | 50.53 | 39.12 | 1237.1 | 1184.7 |
+| cslib | 45.22 | 37.66 | -16.7% | 15.99 | 13.05 | 533.3 | 501.2 |
+| navier-stokes-euler | 59.20 | 51.45 | -13.1% | 20.90 | 17.72 | 330.9 | 324.0 |
+| std | 11.99 | 11.04 | -7.9% | 4.22 | 4.03 | 179.1 | 174.6 |
+
+Adding the projection fusion and a small universe-list memo measured a further
+-2.2% CPU on cslib and -2.5% on navier-stokes-euler (std unchanged), same
+method. Two runs on a busy machine are indicative, not a stable estimate; the
+planned quiet-machine remeasurement of the final tree was not done.
+
+Single unpaired runs of the final tree on every corpus (wall s / CPU s / peak
+MiB), all accepted with the baseline's declaration counts: cedar 4.35 / 15.6 /
+224; con-leche 4.82 / 14.1 / 178; cslib 12.16 / 37.3 / 498; init 1.91 / 7.0 /
+107; mathlib 31.23 / 118.1 / 1185; navier-stokes-euler 13.48 / 51.7 / 326;
+reachability 2.80 / 7.3 / 720; std 3.13 / 11.8 / 170. The baseline's single
+runs, taken earlier under different load and without pinning: cedar 4.60 /
+18.9 / 240; con-leche 4.06 / 15.4 / 189; cslib 12.32 / 52.0 / 528; init 1.91 /
+7.5 / 120; mathlib 39.52 / 165.3 / 1288; navier-stokes-euler 16.79 / 67.7 /
+332; reachability 2.88 / 8.3 / 986; std 3.06 / 12.3 / 177. For reference,
+nano-lean 0.3.3 on Mathlib that day: 36.7 s / 119.2 CPU s / 4954 MiB.
+
+The Arena perf outliers are unchanged by this checkpoint (app-lam 8.0 s,
+magma-list-deep-n36 19 s, beta-ladder 1.4 s, let-ladder 1.0 s, let-fold
+0.34 s), as are the corner-case verdicts, including the two
+`eta-struct-major-*-no-whnf` cases that run to the step budget and decline.
+
+### Validation
+
+Final tree: 113/113 ReleaseSafe unit tests; 248 small Arena and local tests at
+`-j 4` with 0 incorrect or errors (the two budget-exhausting corner cases were
+skipped in that run; they declined as before in the previous full run of 249);
+all nine corpora accepted. The tree before the `isProp` fix additionally
+passed the small groups with a ReleaseSafe executable and at `-j 1` (247 tests
+each, same two skipped) and the x86_64 Linux ReleaseFast cross-build (compile
+only). Those three were not repeated after the `isProp` change. A byte-level
+robustness fuzz of the baseline (3,000 malformed exports, `-j 1` and `-j 4`)
+found no crash or hang; it was not rerun on the final tree. No independent
+review of the final diff took place.
+
+### Unmerged work
+
+Three agents were interrupted by the usage limit. Their trees are in the
+ignored `claude/r15/work/{eval,rules,t2b}` with a `NOTES.md` each. None was
+reviewed, run through the full gates or merged; the figures are the agents'
+own interim measurements.
+
+- eval (rewritten `nbe.zig`): magma-list-deep-n36 19 s -> 1.32 s;
+  magma-string-pair-n9 2.6 s / 310 MiB -> 0.43 s / 78 MiB; reachability 2.9 s /
+  986 MiB -> 1.26 s / 107 MiB; magma-list-pair-n21 3.7 s -> 2.25 s but 29 ->
+  147 MiB. Open: that memory growth, 1 GiB growth on
+  `eta-struct-major-and-no-whnf`, unit tests not yet adapted.
+- rules: `subject-reduction-redex` and both `eta-struct-major-*-no-whnf`
+  accepted in about 15 ms (structure eta before reducing the major; theorem
+  unfolding for majors); a complete universe-level comparison by case split
+  with brute-force tests. Not started: unit-like eta, function eta for
+  constructors and recursors, the structural-equality fast path (let-fold).
+- t2b: a syntactic matcher that avoids constructing expected argument types
+  (std CPU -3.9% on efficiency cores); environment-based checked inference
+  (app-lam, let-ladder) in progress.
+
+Never started or never finished: validation of built-in primitives against
+the export's own definitions (acceleration is still keyed on names), the
+conversion/reduction audit, differential mutation fuzzing against the official
+kernel, and the slow-declaration investigation.
+
+Tools and raw records are under the ignored `claude/r15/` (`suite.py`,
+`tools/ab.py`, `tools/sample.py`, `tools/reject_sites.py`, `results/`,
+`STATE.md`). Human-only files were not edited; `CLAUDE.md` was added.
